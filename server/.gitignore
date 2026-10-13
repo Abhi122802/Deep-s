@@ -1,0 +1,12 @@
+# Server build artifacts and dependencies
+node_modules/
+dist/
+uploads/
+*.log
+
+# Environment variables & secrets (CRITICAL)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
