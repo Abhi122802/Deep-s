@@ -63,6 +63,13 @@ export const baseEnvSchema = z.object({
   TWILIO_ACCOUNT_SID: z.string().default(''),
   TWILIO_AUTH_TOKEN: z.string().default(''),
   TWILIO_PHONE_NUMBER: z.string().default(''),
+
+  // Production Reliability & Security Hardening (Phase 5, Milestone 1)
+  TRUST_PROXY: z.string().default('1'),
+  NOTIFICATION_RECOVERY_INTERVAL_MS: z.coerce.number().default(300000), // 5 minutes default
+  NOTIFICATION_DRAIN_TIMEOUT_MS: z.coerce.number().default(10000), // 10 seconds default drain
+  LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+  LOG_FORMAT: z.enum(['json', 'pretty']).default('json'),
 });
 
 export const envSchema = baseEnvSchema
@@ -98,6 +105,11 @@ const rawEnv = {
   TWILIO_ACCOUNT_SID: process.env.TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN: process.env.TWILIO_AUTH_TOKEN,
   TWILIO_PHONE_NUMBER: process.env.TWILIO_PHONE_NUMBER,
+  TRUST_PROXY: process.env.TRUST_PROXY,
+  NOTIFICATION_RECOVERY_INTERVAL_MS: process.env.NOTIFICATION_RECOVERY_INTERVAL_MS,
+  NOTIFICATION_DRAIN_TIMEOUT_MS: process.env.NOTIFICATION_DRAIN_TIMEOUT_MS,
+  LOG_LEVEL: process.env.LOG_LEVEL,
+  LOG_FORMAT: process.env.LOG_FORMAT,
 };
 
 const parsedEnv = envSchema.parse(rawEnv);

@@ -4,9 +4,12 @@ import { isDbConnected } from '../config/db.js';
 const router = Router();
 
 router.get('/health', (_req: Request, res: Response) => {
-  const dbStatus = isDbConnected() ? 'connected' : 'disconnected';
-  res.json({
-    status: 'ok',
+  const isConnected = isDbConnected();
+  const dbStatus = isConnected ? 'connected' : 'disconnected';
+  const statusCode = isConnected ? 200 : 503;
+
+  res.status(statusCode).json({
+    status: isConnected ? 'ok' : 'degraded',
     service: "Deep's Cake Shop API",
     timestamp: new Date().toISOString(),
     uptimeSeconds: Math.floor(process.uptime()),

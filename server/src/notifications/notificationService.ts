@@ -21,6 +21,7 @@ import { sanitizeLogDetails, isValidEmail, isValidPhone } from './sanitize.js';
 import { renderOrderPlacedTemplate } from './templates/orderPlaced.template.js';
 import { renderOrderStatusTemplate } from './templates/orderStatus.template.js';
 import { renderInquiryQuotationTemplate } from './templates/inquiryQuotation.template.js';
+import { logger } from '../utils/logger.js';
 
 export interface DispatchNotificationOptions {
   channel: NotificationChannel;
@@ -101,7 +102,64 @@ export class NotificationService {
   private readonly stuckSendingThresholdMs = 5 * 60 * 1000; // 5 minutes
   private inFlightDispatches: Map<string, Promise<DispatchNotificationResult>> = new Map();
   private inFlightRetries: Map<string, Promise<RetryNotificationResult>> = new Map();
+  private inFlightTasks: Set<Promise<any>> = new Set();
   private readonly maxRetryCeiling = 5;
+
+  /**
+   * Registers an active asynchronous notification dispatch promise
+   * so that graceful shutdown can drain in-flight operations before database disconnection.
+   */
+  trackTask<T>(promise: Promise<T>): Promise<T> {
+    this.inFlightTasks.add(promise);
+    promise
+      .catch(() => {
+        // Prevent unhandled rejections during tracking
+      })
+      .finally(() => {
+        this.inFlightTasks.delete(promise);
+      });
+    return promise;
+  }
+
+  getActiveTaskCount(): number {
+    return this.inFlightTasks.size;
+  }
+
+  /**
+   * Drains all active in-flight notification tasks up to timeoutMs.
+   * Resolves { drained: true, pendingCount: 0 } if all tasks complete within timeout,
+   * or { drained: false, pendingCount: N } if timeout expires.
+   */
+  async drainInFlight(timeoutMs = 10000): Promise<{ drained: boolean; pendingCount: number }> {
+    if (this.inFlightTasks.size === 0) {
+      return { drained: true, pendingCount: 0 };
+    }
+
+    logger.info(`[Notification Drain] Waiting for ${this.inFlightTasks.size} in-flight notification task(s) to complete (timeout: ${timeoutMs}ms)...`);
+
+    let timeoutId: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<{ timeout: true }>((resolve) => {
+      timeoutId = setTimeout(() => resolve({ timeout: true }), timeoutMs);
+    });
+
+    const allTasksPromise = Promise.allSettled(Array.from(this.inFlightTasks));
+
+    const result = await Promise.race([
+      allTasksPromise.then(() => ({ timeout: false })),
+      timeoutPromise,
+    ]);
+
+    if (timeoutId) clearTimeout(timeoutId);
+
+    if (result.timeout) {
+      const remaining = this.inFlightTasks.size;
+      logger.warn(`[Notification Drain Warning] Drain timeout exceeded (${timeoutMs}ms). ${remaining} task(s) still in-flight. Disconnecting safely without modifying uncertain states.`);
+      return { drained: false, pendingCount: remaining };
+    }
+
+    logger.info('[Notification Drain] All in-flight notification tasks drained successfully.');
+    return { drained: true, pendingCount: 0 };
+  }
 
   constructor() {
     // Register default development mock provider
@@ -110,7 +168,7 @@ export class NotificationService {
     // Validate environment configuration
     const configCheck = validateNotificationConfig(env);
     if (!configCheck.valid && env.NOTIFICATION_MODE === 'production') {
-      console.error(
+      logger.error(
         `[NotificationService Configuration Warning] Production mode misconfigured: ${configCheck.errors.join('; ')}`
       );
     }
@@ -332,7 +390,9 @@ export class NotificationService {
     }
 
     if (recoveredCount > 0) {
-      console.log(`[Notification Recovery] Cleaned up ${recoveredCount} stuck 'sending' notification(s).`);
+      logger.info(`[Notification Recovery] Cleaned up ${recoveredCount} stuck 'sending' notification(s).`, {
+        recoveredCount,
+      });
     }
     return recoveredCount;
   }
@@ -349,6 +409,7 @@ export class NotificationService {
 
     const executionPromise = this.internalDispatch(options);
     this.inFlightDispatches.set(options.idempotencyKey, executionPromise);
+    this.trackTask(executionPromise);
 
     try {
       return await executionPromise;
@@ -577,50 +638,54 @@ export class NotificationService {
     data: OrderPlacedTemplateData,
     customerConsent?: CustomerConsent
   ): Promise<DispatchNotificationResult[]> {
-    const results: DispatchNotificationResult[] = [];
+    const task = (async () => {
+      const results: DispatchNotificationResult[] = [];
 
-    // 1. Transactional Email receipt
-    try {
-      const emailTemplate = renderOrderPlacedTemplate(data, 'email');
-      const emailResult = await this.dispatch({
-        channel: 'email',
-        eventType: 'order_placed',
-        recipient: (data as any).customer?.email || (data as any).email || 'customer@example.com',
-        subject: emailTemplate.subject,
-        message: emailTemplate.message,
-        idempotencyKey: `order-placed:${data.orderId}:email`,
-        metadata: { orderId: data.orderId, ...emailTemplate.metadata },
-        customerConsent,
-      });
-      results.push(emailResult);
-    } catch (err: any) {
-      console.warn(`[Notification Warning] Failed to dispatch order placed email: ${sanitizeLogDetails(err.message)}`);
-    }
-
-    // 2. WhatsApp notification (Strictly requires explicit opt-in consent)
-    if (customerConsent?.whatsapp === true) {
+      // 1. Transactional Email receipt
       try {
-        const phone = (data as any).customer?.phone || (data as any).phone;
-        if (phone) {
-          const whatsappTemplate = renderOrderPlacedTemplate(data, 'whatsapp');
-          const whatsappResult = await this.dispatch({
-            channel: 'whatsapp',
-            eventType: 'order_placed',
-            recipient: phone,
-            subject: whatsappTemplate.subject,
-            message: whatsappTemplate.message,
-            idempotencyKey: `order-placed:${data.orderId}:whatsapp`,
-            metadata: { orderId: data.orderId, ...whatsappTemplate.metadata },
-            customerConsent,
-          });
-          results.push(whatsappResult);
-        }
+        const emailTemplate = renderOrderPlacedTemplate(data, 'email');
+        const emailResult = await this.dispatch({
+          channel: 'email',
+          eventType: 'order_placed',
+          recipient: (data as any).customer?.email || (data as any).email || 'customer@example.com',
+          subject: emailTemplate.subject,
+          message: emailTemplate.message,
+          idempotencyKey: `order-placed:${data.orderId}:email`,
+          metadata: { orderId: data.orderId, ...emailTemplate.metadata },
+          customerConsent,
+        });
+        results.push(emailResult);
       } catch (err: any) {
-        console.warn(`[Notification Warning] Failed to dispatch order placed whatsapp: ${sanitizeLogDetails(err.message)}`);
+        logger.warn(`[Notification Warning] Failed to dispatch order placed email: ${sanitizeLogDetails(err.message)}`);
       }
-    }
 
-    return results;
+      // 2. WhatsApp notification (Strictly requires explicit opt-in consent)
+      if (customerConsent?.whatsapp === true) {
+        try {
+          const phone = (data as any).customer?.phone || (data as any).phone;
+          if (phone) {
+            const whatsappTemplate = renderOrderPlacedTemplate(data, 'whatsapp');
+            const whatsappResult = await this.dispatch({
+              channel: 'whatsapp',
+              eventType: 'order_placed',
+              recipient: phone,
+              subject: whatsappTemplate.subject,
+              message: whatsappTemplate.message,
+              idempotencyKey: `order-placed:${data.orderId}:whatsapp`,
+              metadata: { orderId: data.orderId, ...whatsappTemplate.metadata },
+              customerConsent,
+            });
+            results.push(whatsappResult);
+          }
+        } catch (err: any) {
+          logger.warn(`[Notification Warning] Failed to dispatch order placed whatsapp: ${sanitizeLogDetails(err.message)}`);
+        }
+      }
+
+      return results;
+    })();
+
+    return this.trackTask(task);
   }
 
   /**
@@ -633,49 +698,53 @@ export class NotificationService {
     customerPhone?: string,
     customerConsent?: CustomerConsent
   ): Promise<DispatchNotificationResult[]> {
-    const results: DispatchNotificationResult[] = [];
+    const task = (async () => {
+      const results: DispatchNotificationResult[] = [];
 
-    // 1. Email notification
-    if (customerEmail) {
-      try {
-        const emailTemplate = renderOrderStatusTemplate(data, 'email');
-        const emailResult = await this.dispatch({
-          channel: 'email',
-          eventType: 'order_status_updated',
-          recipient: customerEmail,
-          subject: emailTemplate.subject,
-          message: emailTemplate.message,
-          idempotencyKey: `order-status:${data.orderId}:${data.newStatus}:email`,
-          metadata: { orderId: data.orderId, status: data.newStatus, ...emailTemplate.metadata },
-          customerConsent,
-        });
-        results.push(emailResult);
-      } catch (err: any) {
-        console.warn(`[Notification Warning] Failed to dispatch order status email: ${sanitizeLogDetails(err.message)}`);
+      // 1. Email notification
+      if (customerEmail) {
+        try {
+          const emailTemplate = renderOrderStatusTemplate(data, 'email');
+          const emailResult = await this.dispatch({
+            channel: 'email',
+            eventType: 'order_status_updated',
+            recipient: customerEmail,
+            subject: emailTemplate.subject,
+            message: emailTemplate.message,
+            idempotencyKey: `order-status:${data.orderId}:${data.newStatus}:email`,
+            metadata: { orderId: data.orderId, status: data.newStatus, ...emailTemplate.metadata },
+            customerConsent,
+          });
+          results.push(emailResult);
+        } catch (err: any) {
+          logger.warn(`[Notification Warning] Failed to dispatch order status email: ${sanitizeLogDetails(err.message)}`);
+        }
       }
-    }
 
-    // 2. WhatsApp notification (Strictly requires explicit opt-in consent)
-    if (customerPhone && customerConsent?.whatsapp === true) {
-      try {
-        const whatsappTemplate = renderOrderStatusTemplate(data, 'whatsapp');
-        const whatsappResult = await this.dispatch({
-          channel: 'whatsapp',
-          eventType: 'order_status_updated',
-          recipient: customerPhone,
-          subject: whatsappTemplate.subject,
-          message: whatsappTemplate.message,
-          idempotencyKey: `order-status:${data.orderId}:${data.newStatus}:whatsapp`,
-          metadata: { orderId: data.orderId, status: data.newStatus, ...whatsappTemplate.metadata },
-          customerConsent,
-        });
-        results.push(whatsappResult);
-      } catch (err: any) {
-        console.warn(`[Notification Warning] Failed to dispatch order status whatsapp: ${sanitizeLogDetails(err.message)}`);
+      // 2. WhatsApp notification (Strictly requires explicit opt-in consent)
+      if (customerPhone && customerConsent?.whatsapp === true) {
+        try {
+          const whatsappTemplate = renderOrderStatusTemplate(data, 'whatsapp');
+          const whatsappResult = await this.dispatch({
+            channel: 'whatsapp',
+            eventType: 'order_status_updated',
+            recipient: customerPhone,
+            subject: whatsappTemplate.subject,
+            message: whatsappTemplate.message,
+            idempotencyKey: `order-status:${data.orderId}:${data.newStatus}:whatsapp`,
+            metadata: { orderId: data.orderId, status: data.newStatus, ...whatsappTemplate.metadata },
+            customerConsent,
+          });
+          results.push(whatsappResult);
+        } catch (err: any) {
+          logger.warn(`[Notification Warning] Failed to dispatch order status whatsapp: ${sanitizeLogDetails(err.message)}`);
+        }
       }
-    }
 
-    return results;
+      return results;
+    })();
+
+    return this.trackTask(task);
   }
 
   /**
@@ -688,57 +757,61 @@ export class NotificationService {
     customerPhone?: string,
     customerConsent?: CustomerConsent
   ): Promise<DispatchNotificationResult[]> {
-    const results: DispatchNotificationResult[] = [];
+    const task = (async () => {
+      const results: DispatchNotificationResult[] = [];
 
-    // 1. Email proposal
-    if (customerEmail) {
-      try {
-        const emailTemplate = renderInquiryQuotationTemplate(data, 'email');
-        const emailResult = await this.dispatch({
-          channel: 'email',
-          eventType: 'inquiry_quotation_sent',
-          recipient: customerEmail,
-          subject: emailTemplate.subject,
-          message: emailTemplate.message,
-          idempotencyKey: `inquiry-quote:${data.referenceId}:${data.quotedAmount}:email`,
-          metadata: {
-            referenceId: data.referenceId,
-            quotedAmount: data.quotedAmount,
-            ...emailTemplate.metadata,
-          },
-          customerConsent,
-        });
-        results.push(emailResult);
-      } catch (err: any) {
-        console.warn(`[Notification Warning] Failed to dispatch quotation email: ${sanitizeLogDetails(err.message)}`);
+      // 1. Email proposal
+      if (customerEmail) {
+        try {
+          const emailTemplate = renderInquiryQuotationTemplate(data, 'email');
+          const emailResult = await this.dispatch({
+            channel: 'email',
+            eventType: 'inquiry_quotation_sent',
+            recipient: customerEmail,
+            subject: emailTemplate.subject,
+            message: emailTemplate.message,
+            idempotencyKey: `inquiry-quote:${data.referenceId}:${data.quotedAmount}:email`,
+            metadata: {
+              referenceId: data.referenceId,
+              quotedAmount: data.quotedAmount,
+              ...emailTemplate.metadata,
+            },
+            customerConsent,
+          });
+          results.push(emailResult);
+        } catch (err: any) {
+          logger.warn(`[Notification Warning] Failed to dispatch quotation email: ${sanitizeLogDetails(err.message)}`);
+        }
       }
-    }
 
-    // 2. WhatsApp proposal (Strictly requires explicit opt-in consent)
-    if (customerPhone && customerConsent?.whatsapp === true) {
-      try {
-        const whatsappTemplate = renderInquiryQuotationTemplate(data, 'whatsapp');
-        const whatsappResult = await this.dispatch({
-          channel: 'whatsapp',
-          eventType: 'inquiry_quotation_sent',
-          recipient: customerPhone,
-          subject: whatsappTemplate.subject,
-          message: whatsappTemplate.message,
-          idempotencyKey: `inquiry-quote:${data.referenceId}:${data.quotedAmount}:whatsapp`,
-          metadata: {
-            referenceId: data.referenceId,
-            quotedAmount: data.quotedAmount,
-            ...whatsappTemplate.metadata,
-          },
-          customerConsent,
-        });
-        results.push(whatsappResult);
-      } catch (err: any) {
-        console.warn(`[Notification Warning] Failed to dispatch quotation whatsapp: ${sanitizeLogDetails(err.message)}`);
+      // 2. WhatsApp proposal (Strictly requires explicit opt-in consent)
+      if (customerPhone && customerConsent?.whatsapp === true) {
+        try {
+          const whatsappTemplate = renderInquiryQuotationTemplate(data, 'whatsapp');
+          const whatsappResult = await this.dispatch({
+            channel: 'whatsapp',
+            eventType: 'inquiry_quotation_sent',
+            recipient: customerPhone,
+            subject: whatsappTemplate.subject,
+            message: whatsappTemplate.message,
+            idempotencyKey: `inquiry-quote:${data.referenceId}:${data.quotedAmount}:whatsapp`,
+            metadata: {
+              referenceId: data.referenceId,
+              quotedAmount: data.quotedAmount,
+              ...whatsappTemplate.metadata,
+            },
+            customerConsent,
+          });
+          results.push(whatsappResult);
+        } catch (err: any) {
+          logger.warn(`[Notification Warning] Failed to dispatch quotation whatsapp: ${sanitizeLogDetails(err.message)}`);
+        }
       }
-    }
 
-    return results;
+      return results;
+    })();
+
+    return this.trackTask(task);
   }
 
   /**
@@ -1143,6 +1216,7 @@ export class NotificationService {
     })();
 
     this.inFlightRetries.set(record.notificationId, retryPromise);
+    this.trackTask(retryPromise);
 
     try {
       return await retryPromise;

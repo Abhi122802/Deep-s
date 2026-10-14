@@ -1,11 +1,13 @@
 import express, { Express } from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
 import cookieParser from 'cookie-parser';
 import path from 'path';
 import { env } from './config/env.js';
 import { UPLOADS_DIR } from './config/cloudinary.js';
 import { errorHandler, notFoundHandler } from './middlewares/error.middleware.js';
 import { generalLimiter } from './middlewares/rateLimiter.js';
+import { requestLogger } from './middlewares/requestLogger.js';
 
 import healthRoutes from './routes/health.routes.js';
 import cakeRoutes from './routes/cake.routes.js';
@@ -23,6 +25,36 @@ export const DEV_ALLOWED_ORIGINS = [
   'http://localhost:5000',
   'http://127.0.0.1:5000',
 ];
+
+/**
+ * Configures Express trust proxy based on deployment topology.
+ *
+ * Supported values:
+ * - '0' | 'false': Direct internet exposure (no reverse proxy). Disables proxy trust to prevent client spoofing.
+ * - '1' | 'true': Standard single reverse proxy (Cloudflare, AWS ALB, Nginx, Render, etc.). Trusts immediate upstream proxy.
+ * - '<number>': Multi-hop proxy chain (e.g., '2' for Cloudflare + Nginx).
+ * - '<ip/subnet/cidr>': Specific trusted proxy IP address or subnet (e.g., '127.0.0.1', 'loopback', '10.0.0.0/8').
+ *
+ * CRITICAL DEPLOYMENT DIRECTIVE:
+ * If the API is deployed directly to the public internet without an upstream reverse proxy,
+ * TRUST_PROXY MUST be set to '0' or 'false' to prevent client spoofing of X-Forwarded-For headers,
+ * which would otherwise allow attackers to bypass IP-based rate limiting.
+ */
+export function configureTrustProxy(app: Express, trustProxySetting: string = env.TRUST_PROXY): void {
+  const normalized = (trustProxySetting || '').trim().toLowerCase();
+
+  if (normalized === '0' || normalized === 'false') {
+    app.set('trust proxy', false);
+  } else if (normalized === '1' || normalized === 'true') {
+    app.set('trust proxy', 1);
+  } else if (!isNaN(Number(normalized)) && Number(normalized) >= 0) {
+    app.set('trust proxy', Number(normalized));
+  } else if (trustProxySetting && trustProxySetting.trim().length > 0) {
+    app.set('trust proxy', trustProxySetting.trim());
+  } else {
+    app.set('trust proxy', false);
+  }
+}
 
 /**
  * Resolves permitted origins based on environment and configured FRONTEND_URL.
@@ -65,6 +97,22 @@ export function isOriginAllowed(
 
 export function createApp(): Express {
   const app = express();
+
+  // Configure reverse proxy trust
+  configureTrustProxy(app, env.TRUST_PROXY);
+
+  // Security HTTP Headers via Helmet
+  // ContentSecurityPolicy is disabled on the REST API to avoid breaking cross-origin clients and external payment scripts
+  // CrossOriginResourcePolicy is configured to allow cross-origin image embedding for /uploads
+  app.use(
+    helmet({
+      contentSecurityPolicy: false,
+      crossOriginResourcePolicy: { policy: 'cross-origin' },
+    })
+  );
+
+  // Attach correlation ID and structured access logging
+  app.use(requestLogger);
 
   app.use(
     cors({

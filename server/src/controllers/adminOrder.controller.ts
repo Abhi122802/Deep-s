@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import { OrderModel, IOrder } from '../models/Order.js';
 import { isDbConnected } from '../config/db.js';
 import { notificationService } from '../notifications/notificationService.js';
+import { logger } from '../utils/logger.js';
 
 export const VALID_ORDER_STATUSES = [
   'Pending',
@@ -523,7 +524,7 @@ export async function updateAdminOrderStatus(
           (order as any).notificationPreferences
         )
         .catch((notifErr: any) => {
-          console.warn(`[Notification Note] Could not dispatch order status notification: ${notifErr.message}`);
+          logger.warn(`[Notification Note] Could not dispatch order status notification: ${notifErr.message}`);
         });
 
       res.json({
@@ -602,7 +603,7 @@ export async function updateAdminOrderStatus(
         memoryOrder.notificationPreferences
       )
       .catch((notifErr: any) => {
-        console.warn(`[Notification Note] Could not dispatch order status notification: ${notifErr.message}`);
+        logger.warn(`[Notification Note] Could not dispatch order status notification: ${notifErr.message}`);
       });
 
     res.json({

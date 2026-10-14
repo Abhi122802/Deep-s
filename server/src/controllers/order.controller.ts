@@ -4,6 +4,7 @@ import { CakeModel } from '../models/Cake.js';
 import { isDbConnected } from '../config/db.js';
 import { DEMO_CAKES } from '../data/cakes.js';
 import { notificationService } from '../notifications/notificationService.js';
+import { logger } from '../utils/logger.js';
 
 export async function createOrder(
   req: Request,
@@ -164,7 +165,7 @@ export async function createOrder(
         notificationPreferences
       )
       .catch((notifErr: any) => {
-        console.warn(`[Notification Note] Could not dispatch order placed notification: ${notifErr.message}`);
+        logger.warn(`[Notification Note] Could not dispatch order placed notification: ${notifErr.message}`);
       });
 
     res.status(201).json({

@@ -1,16 +1,41 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import request from 'supertest';
+import mongoose from 'mongoose';
 import { app } from '../src/app.js';
 
 describe('Deep’s Cake Shop — Phase 2 Backend API Test Suite', () => {
   describe('1. Health Check Endpoint', () => {
-    it('GET /api/health returns 200 and healthy service payload', async () => {
-      const res = await request(app).get('/api/health');
-      assert.equal(res.status, 200);
-      assert.equal(res.body.status, 'ok');
-      assert.equal(res.body.service, "Deep's Cake Shop API");
-      assert.ok(typeof res.body.uptimeSeconds === 'number');
+    it('GET /api/health returns 503 and degraded payload when database is disconnected', async () => {
+      const origState = mongoose.connection.readyState;
+      Object.defineProperty(mongoose.connection, 'readyState', { value: 0, configurable: true });
+      try {
+        const res = await request(app).get('/api/health');
+        assert.equal(res.status, 503);
+        assert.equal(res.body.status, 'degraded');
+        assert.equal(res.body.database, 'disconnected');
+        assert.equal(res.body.service, "Deep's Cake Shop API");
+        assert.ok(typeof res.body.uptimeSeconds === 'number');
+        assert.equal(res.body.version, '2.0.0');
+      } finally {
+        Object.defineProperty(mongoose.connection, 'readyState', { value: origState, configurable: true });
+      }
+    });
+
+    it('GET /api/health returns 200 and healthy service payload when database is connected', async () => {
+      const origState = mongoose.connection.readyState;
+      Object.defineProperty(mongoose.connection, 'readyState', { value: 1, configurable: true });
+      try {
+        const res = await request(app).get('/api/health');
+        assert.equal(res.status, 200);
+        assert.equal(res.body.status, 'ok');
+        assert.equal(res.body.database, 'connected');
+        assert.equal(res.body.service, "Deep's Cake Shop API");
+        assert.ok(typeof res.body.uptimeSeconds === 'number');
+        assert.equal(res.body.version, '2.0.0');
+      } finally {
+        Object.defineProperty(mongoose.connection, 'readyState', { value: origState, configurable: true });
+      }
     });
   });
 
@@ -1703,7 +1728,6 @@ describe('Deep’s Cake Shop — Phase 2 Backend API Test Suite', () => {
         .get('/api/health')
         .set('Origin', 'http://localhost:5173');
 
-      assert.equal(res.status, 200);
       assert.equal(res.headers['access-control-allow-origin'], 'http://localhost:5173');
       assert.equal(res.headers['access-control-allow-credentials'], 'true');
     });
@@ -1713,7 +1737,6 @@ describe('Deep’s Cake Shop — Phase 2 Backend API Test Suite', () => {
         .get('/api/health')
         .set('Origin', 'https://unauthorized-random-origin.org');
 
-      assert.equal(res.status, 200);
       assert.equal(
         res.headers['access-control-allow-origin'],
         undefined,
@@ -2484,6 +2507,656 @@ describe('Deep’s Cake Shop — Phase 2 Backend API Test Suite', () => {
       assert.equal(retryRes.status, 200);
       assert.equal(retryRes.body.data.deliveryStatus, 'delivered');
       assert.equal(retryRes.body.data.metadata?.uncertainOutcomeAcknowledged, true);
+    });
+  });
+
+  describe('17. Phase 5 Milestone 1 Production Reliability & Security Hardening', () => {
+    let testAdminToken: string;
+
+    it('sets up admin auth token for Phase 5 Milestone 1 tests', async () => {
+      const { env } = await import('../src/config/env.js');
+      const jwt = (await import('jsonwebtoken')).default;
+      testAdminToken = jwt.sign(
+        { id: '67a000000000000000000099', username: 'admin', role: 'superadmin' },
+        env.JWT_SECRET,
+        { expiresIn: '1h' }
+      );
+      assert.ok(testAdminToken);
+    });
+
+    // A. HTTP Security & Helmet Tests
+    it('Helmet sets standard security headers on API responses', async () => {
+      const res = await request(app).get('/api/health');
+      assert.equal(res.headers['x-content-type-options'], 'nosniff');
+      assert.equal(res.headers['x-frame-options'], 'SAMEORIGIN');
+      assert.equal(res.headers['x-dns-prefetch-control'], 'off');
+      assert.equal(res.headers['cross-origin-resource-policy'], 'cross-origin');
+    });
+
+    it('configureTrustProxy sets trust proxy setting on Express app', async () => {
+      const express = (await import('express')).default;
+      const { configureTrustProxy } = await import('../src/app.js');
+
+      const testApp1 = express();
+      configureTrustProxy(testApp1, '1');
+      assert.equal(testApp1.get('trust proxy'), 1);
+
+      const testApp2 = express();
+      configureTrustProxy(testApp2, 'false');
+      assert.equal(testApp2.get('trust proxy'), false);
+
+      const testApp3 = express();
+      configureTrustProxy(testApp3, '2');
+      assert.equal(testApp3.get('trust proxy'), 2);
+
+      const testApp4 = express();
+      configureTrustProxy(testApp4, '127.0.0.1');
+      assert.equal(testApp4.get('trust proxy'), '127.0.0.1');
+    });
+
+    // B. Correlation ID & Structured Logging Tests
+    it('generates X-Request-Id correlation header when not supplied by client', async () => {
+      const res = await request(app).get('/api/health');
+      assert.ok(res.headers['x-request-id']);
+      assert.ok(res.headers['x-request-id'].startsWith('req_'));
+    });
+
+    it('propagates client-supplied X-Request-Id on response', async () => {
+      const clientCorrelationId = 'client-trace-123456789';
+      const res = await request(app)
+        .get('/api/health')
+        .set('X-Request-Id', clientCorrelationId);
+      assert.equal(res.headers['x-request-id'], clientCorrelationId);
+    });
+
+    it('redactLogData redacts sensitive keys and masks emails/phone numbers', async () => {
+      const { redactLogData } = await import('../src/utils/logger.js');
+      const sample = {
+        username: 'admin',
+        password: 'SuperSecretPassword@2026',
+        token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test',
+        authorization: 'Bearer secret_token_123',
+        email: 'customer.support@deepscakeshop.in',
+        phone: '9876543210',
+        metadata: {
+          apiKey: 'SG.1234567890abcdef',
+          mongodbUri: 'mongodb+srv://user:pass@cluster0.net/db',
+        },
+      };
+
+      const redacted = redactLogData(sample);
+      assert.equal(redacted.username, 'admin');
+      assert.equal(redacted.password, '[REDACTED]');
+      assert.equal(redacted.token, '[REDACTED]');
+      assert.equal(redacted.authorization, '[REDACTED]');
+      assert.ok(redacted.email.includes('c***@deepscakeshop.in'));
+      assert.ok(redacted.phone.includes('******3210'));
+      assert.equal(redacted.metadata.apiKey, '[REDACTED]');
+      assert.equal(redacted.metadata.mongodbUri, '[REDACTED]');
+    });
+
+    // C. Notification Recovery Scheduler Lifecycle Tests
+    it('NotificationRecoveryScheduler manages timer lifecycle and prevents duplicate timers', async () => {
+      const { NotificationRecoveryScheduler } = await import('../src/notifications/notificationRecoveryScheduler.js');
+      const scheduler = new NotificationRecoveryScheduler(60000);
+
+      assert.equal(scheduler.isRunning(), false);
+      scheduler.start();
+      assert.equal(scheduler.isRunning(), true);
+
+      // Calling start again should not throw and should remain running
+      scheduler.start();
+      assert.equal(scheduler.isRunning(), true);
+
+      scheduler.stop();
+      assert.equal(scheduler.isRunning(), false);
+    });
+
+    it('NotificationRecoveryScheduler prevents concurrent tick executions', async () => {
+      const { NotificationRecoveryScheduler } = await import('../src/notifications/notificationRecoveryScheduler.js');
+      const scheduler = new NotificationRecoveryScheduler(60000);
+
+      (scheduler as any).isExecuting = true;
+      const count = await scheduler.tick();
+      assert.equal(count, 0, 'Must return 0 and skip when scan is already in progress');
+      (scheduler as any).isExecuting = false;
+    });
+
+    it('recoverStuckSendingLogs logs clean count via structured logger without leaking payloads', async () => {
+      const { notificationService } = await import('../src/notifications/notificationService.js');
+      const { logger } = await import('../src/utils/logger.js');
+
+      let loggedMessage = '';
+      let loggedMeta: any = null;
+      const origInfo = logger.info.bind(logger);
+      (logger as any).info = (msg: string, meta?: any) => {
+        loggedMessage = msg;
+        loggedMeta = meta;
+        origInfo(msg, meta);
+      };
+
+      try {
+        const count = await notificationService.recoverStuckSendingLogs(0);
+        assert.ok(typeof count === 'number');
+        if (count > 0) {
+          assert.ok(loggedMessage.includes('Notification Recovery'));
+          assert.ok(loggedMeta && typeof loggedMeta.recoveredCount === 'number');
+          assert.equal(loggedMeta.password, undefined);
+          assert.equal(loggedMeta.token, undefined);
+        }
+      } finally {
+        logger.info = origInfo;
+      }
+    });
+
+    // D. Admin Password Management Tests (PUT /api/auth/password)
+    it('PUT /api/auth/password rejects unauthenticated request with 401', async () => {
+      const res = await request(app)
+        .put('/api/auth/password')
+        .send({ currentPassword: 'any', newPassword: 'AnyNewPassword@123' });
+      assert.equal(res.status, 401);
+      assert.equal(res.body.success, false);
+    });
+
+    it('PUT /api/auth/password rejects weak new password with 400 (< 10 chars, missing complexity)', async () => {
+      const res = await request(app)
+        .put('/api/auth/password')
+        .set('Authorization', `Bearer ${testAdminToken}`)
+        .send({
+          currentPassword: 'AdminBakery@2026',
+          newPassword: 'short',
+        });
+      assert.equal(res.status, 400);
+      assert.equal(res.body.success, false);
+    });
+
+    it('PUT /api/auth/password rejects new password identical to current password with 400', async () => {
+      const res = await request(app)
+        .put('/api/auth/password')
+        .set('Authorization', `Bearer ${testAdminToken}`)
+        .send({
+          currentPassword: 'AdminBakery@2026',
+          newPassword: 'AdminBakery@2026',
+        });
+      assert.equal(res.status, 400);
+      assert.equal(res.body.success, false);
+      const hasIdenticalError =
+        (typeof res.body.message === 'string' && res.body.message.includes('identical')) ||
+        (Array.isArray(res.body.errors) &&
+          res.body.errors.some((err: any) => err.message && err.message.includes('identical')));
+      assert.ok(hasIdenticalError, 'Should report that new password cannot be identical to current password');
+    });
+
+    it('PUT /api/auth/password rejects incorrect current password with 401', async () => {
+      const res = await request(app)
+        .put('/api/auth/password')
+        .set('Authorization', `Bearer ${testAdminToken}`)
+        .send({
+          currentPassword: 'WrongPassword@999',
+          newPassword: 'BrandNewSecureBakery@2026',
+        });
+      assert.equal(res.status, 401);
+      assert.equal(res.body.success, false);
+      assert.ok(res.body.message.includes('verification failed'));
+    });
+
+    it('PUT /api/auth/password successfully updates password and clears cookie session', async () => {
+      const res = await request(app)
+        .put('/api/auth/password')
+        .set('Authorization', `Bearer ${testAdminToken}`)
+        .send({
+          currentPassword: 'AdminBakery@2026',
+          newPassword: 'SuperBrandNewSecureBakery@2026',
+          confirmPassword: 'SuperBrandNewSecureBakery@2026',
+        });
+
+      assert.equal(res.status, 200);
+      assert.equal(res.body.success, true);
+      assert.ok(res.body.message.includes('successfully updated'));
+      assert.ok(res.body.sessionRevocation);
+      assert.equal(res.body.sessionRevocation.cookieSessionCleared, true);
+      assert.ok(res.body.sessionRevocation.bearerTokenLimitation);
+
+      // Verify Set-Cookie clears admin_token
+      const setCookie = res.headers['set-cookie'];
+      assert.ok(setCookie);
+      const cookieStr = Array.isArray(setCookie) ? setCookie.join(';') : String(setCookie);
+      assert.ok(cookieStr.includes('admin_token=;'));
+
+      // Verify subsequent login succeeds with new password
+      const loginResSuccess = await request(app)
+        .post('/api/auth/login')
+        .send({
+          usernameOrEmail: 'admin',
+          password: 'SuperBrandNewSecureBakery@2026',
+        });
+      assert.equal(loginResSuccess.status, 200);
+      assert.equal(loginResSuccess.body.success, true);
+      const newAdminToken = loginResSuccess.body.token;
+      assert.ok(newAdminToken);
+
+      // Verify that the old testAdminToken is now revoked and rejected with 401
+      const oldTokenRevokedRes = await request(app)
+        .get('/api/admin/stats')
+        .set('Authorization', `Bearer ${testAdminToken}`);
+      assert.equal(oldTokenRevokedRes.status, 401);
+      assert.equal(oldTokenRevokedRes.body.success, false);
+
+      // Verify subsequent login fails with old password
+      const loginResFail = await request(app)
+        .post('/api/auth/login')
+        .send({
+          usernameOrEmail: 'admin',
+          password: 'AdminBakery@2026',
+        });
+      assert.equal(loginResFail.status, 401);
+      assert.equal(loginResFail.body.success, false);
+
+      // Restore password back to default for idempotency using the new token
+      const restoreRes = await request(app)
+        .put('/api/auth/password')
+        .set('Authorization', `Bearer ${newAdminToken}`)
+        .send({
+          currentPassword: 'SuperBrandNewSecureBakery@2026',
+          newPassword: 'AdminBakery@2026',
+          confirmPassword: 'AdminBakery@2026',
+        });
+      assert.equal(restoreRes.status, 200);
+
+      // Verify that newAdminToken is now also revoked after restoring password
+      const restoredRevokedRes = await request(app)
+        .get('/api/admin/stats')
+        .set('Authorization', `Bearer ${newAdminToken}`);
+      assert.equal(restoredRevokedRes.status, 401);
+
+      // Re-login with default password to refresh testAdminToken for subsequent operations
+      const reLoginRes = await request(app)
+        .post('/api/auth/login')
+        .send({
+          usernameOrEmail: 'admin',
+          password: 'AdminBakery@2026',
+        });
+      assert.equal(reLoginRes.status, 200);
+      testAdminToken = reLoginRes.body.token;
+    });
+
+    it('legacy tokens lacking tokenVersion are handled safely based on migration policy', async () => {
+      const { env } = await import('../src/config/env.js');
+      const jwt = (await import('jsonwebtoken')).default;
+      const { MEMORY_ADMIN } = await import('../src/models/Admin.js');
+
+      // Create a legacy token without tokenVersion claim
+      const legacyToken = jwt.sign(
+        { id: MEMORY_ADMIN.id, username: MEMORY_ADMIN.username, role: 'superadmin' },
+        env.JWT_SECRET,
+        { expiresIn: '1h' }
+      );
+
+      // When admin has rotated password (tokenVersion > 0), legacy token must be rejected
+      const origTokenVersion = MEMORY_ADMIN.tokenVersion;
+      try {
+        MEMORY_ADMIN.tokenVersion = 5;
+        const resRevoked = await request(app)
+          .get('/api/admin/stats')
+          .set('Authorization', `Bearer ${legacyToken}`);
+        assert.equal(resRevoked.status, 401);
+        assert.ok(resRevoked.body.message.includes('revoked'));
+
+        // When token has an explicitly mismatched tokenVersion, it is rejected
+        const mismatchedToken = jwt.sign(
+          { id: MEMORY_ADMIN.id, username: MEMORY_ADMIN.username, role: 'superadmin', tokenVersion: 1 },
+          env.JWT_SECRET,
+          { expiresIn: '1h' }
+        );
+        const resMismatch = await request(app)
+          .get('/api/admin/stats')
+          .set('Authorization', `Bearer ${mismatchedToken}`);
+        assert.equal(resMismatch.status, 401);
+
+        // When tokenVersion matches current admin version, it is accepted
+        const validToken = jwt.sign(
+          { id: MEMORY_ADMIN.id, username: MEMORY_ADMIN.username, role: 'superadmin', tokenVersion: 5 },
+          env.JWT_SECRET,
+          { expiresIn: '1h' }
+        );
+        const resValid = await request(app)
+          .get('/api/admin/stats')
+          .set('Authorization', `Bearer ${validToken}`);
+        assert.equal(resValid.status, 200);
+
+        // When admin tokenVersion is 0 (unmigrated/initial state), legacy tokens without claim are accepted
+        MEMORY_ADMIN.tokenVersion = 0;
+        const resMigrated = await request(app)
+          .get('/api/admin/stats')
+          .set('Authorization', `Bearer ${legacyToken}`);
+        assert.equal(resMigrated.status, 200);
+      } finally {
+        MEMORY_ADMIN.tokenVersion = origTokenVersion;
+      }
+    });
+
+    // E. Request ID Validation & Sanitization Tests
+    it('rejects oversized (>64 chars) X-Request-Id and generates server-side UUID fallback', async () => {
+      const oversizedId = 'A'.repeat(80);
+      const res = await request(app)
+        .get('/api/health')
+        .set('X-Request-Id', oversizedId);
+
+      const returnedId = res.headers['x-request-id'];
+      assert.ok(returnedId);
+      assert.ok(returnedId.startsWith('req_'));
+      assert.notEqual(returnedId, oversizedId);
+      assert.ok(returnedId.length <= 64);
+    });
+
+    it('rejects invalid characters in X-Request-Id and generates server-side UUID fallback', async () => {
+      const invalidChars = '<script>alert(1)</script>';
+      const res = await request(app)
+        .get('/api/health')
+        .set('X-Request-Id', invalidChars);
+
+      const returnedId = res.headers['x-request-id'];
+      assert.ok(returnedId);
+      assert.ok(returnedId.startsWith('req_'));
+      assert.notEqual(returnedId, invalidChars);
+      assert.ok(!returnedId.includes('<'));
+    });
+
+    it('trims whitespace around valid client-supplied X-Request-Id', async () => {
+      const baseId = 'trace-valid_request-12345';
+      const paddedId = `   ${baseId}   `;
+      const res = await request(app)
+        .get('/api/health')
+        .set('X-Request-Id', paddedId);
+
+      assert.equal(res.headers['x-request-id'], baseId);
+    });
+
+    it('accepts valid client-supplied X-Request-Id matching ^[a-zA-Z0-9_-]{1,64}$', async () => {
+      const validId = 'Client_Trace-ID-99.2026'.replace('.', '_'); // ensure matches [a-zA-Z0-9_-]
+      const res = await request(app)
+        .get('/api/health')
+        .set('X-Request-Id', validId);
+
+      assert.equal(res.headers['x-request-id'], validId);
+    });
+
+    it('requestLogger logs pathname without query strings and omits sensitive query parameters', async () => {
+      const express = (await import('express')).default;
+      const { requestLogger } = await import('../src/middlewares/requestLogger.js');
+      const { logger } = await import('../src/utils/logger.js');
+
+      let loggedPath = '';
+      const origInfo = logger.info.bind(logger);
+      (logger as any).info = (msg: string, meta?: any) => {
+        if (meta && meta.path) {
+          loggedPath = meta.path;
+        }
+        origInfo(msg, meta);
+      };
+
+      try {
+        const testApp = express();
+        testApp.use(requestLogger);
+        testApp.get('/test-query', (_req, res) => res.json({ ok: true }));
+
+        const res = await request(testApp)
+          .get('/test-query?secret=SuperSecretToken123&password=SecretPass456&client=test');
+        assert.equal(res.status, 200);
+        assert.equal(loggedPath, '/test-query');
+        assert.ok(!loggedPath.includes('secret'));
+        assert.ok(!loggedPath.includes('password'));
+      } finally {
+        logger.info = origInfo;
+      }
+    });
+
+    // F. Notification In-Flight Task Tracking & Safe Draining Tests
+    it('drainInFlight completes immediately with drained=true when no tasks are active', async () => {
+      const { drainInFlight, getActiveTaskCount } = await import('../src/notifications/notificationService.js');
+      const count = getActiveTaskCount();
+      const result = await drainInFlight(1000);
+      assert.equal(result.drained, true);
+      assert.equal(result.pendingCount, count);
+    });
+
+    it('drainInFlight waits for tracked in-flight tasks to resolve', async () => {
+      const { drainInFlight, trackTask } = await import('../src/notifications/notificationService.js');
+
+      let taskFinished = false;
+      const delayedTask = new Promise<void>((resolve) => {
+        setTimeout(() => {
+          taskFinished = true;
+          resolve();
+        }, 50);
+      });
+
+      trackTask(delayedTask);
+      const result = await drainInFlight(1000);
+      assert.equal(result.drained, true);
+      assert.equal(taskFinished, true);
+    });
+
+    it('drainInFlight handles timeout gracefully when task exceeds duration', async () => {
+      const { drainInFlight, trackTask } = await import('../src/notifications/notificationService.js');
+
+      // Unresolved promise that takes longer than drain timeout
+      const longTask = new Promise<void>((resolve) => {
+        setTimeout(resolve, 500);
+      });
+
+      trackTask(longTask);
+      const result = await drainInFlight(20);
+      assert.equal(result.drained, false);
+      assert.ok(result.pendingCount >= 1);
+    });
+
+    it('createShutdownHandler executes shutdown sequence idempotently upon repeated signals', async () => {
+      const { createShutdownHandler } = await import('../src/index.js');
+
+      let serverClosedCount = 0;
+      let schedulerStoppedCount = 0;
+
+      const mockServer = {
+        close: (cb?: () => void) => {
+          serverClosedCount++;
+          if (cb) cb();
+        },
+      };
+
+      const mockScheduler = {
+        stop: () => {
+          schedulerStoppedCount++;
+        },
+      };
+
+      const shutdownHandler = createShutdownHandler({
+        server: mockServer as any,
+        recoveryScheduler: mockScheduler as any,
+        drainTimeoutMs: 50,
+      });
+
+      // Call twice with different signals
+      await shutdownHandler('SIGTERM');
+      await shutdownHandler('SIGINT');
+
+      // Assert idempotent execution: close and stop called exactly once
+      assert.equal(serverClosedCount, 1);
+      assert.equal(schedulerStoppedCount, 1);
+    });
+
+    it('createShutdownHandler closes idle connections and enforces bounded timeout if server.close hangs', async () => {
+      const { createShutdownHandler } = await import('../src/index.js');
+
+      let idleClosed = false;
+      let allClosed = false;
+      let dbDisconnected = false;
+
+      const mockHangingServer = {
+        close: (_cb?: (err?: Error) => void) => {
+          // Intentionally do not invoke cb to simulate hanging keep-alive connections
+        },
+        closeIdleConnections: () => {
+          idleClosed = true;
+        },
+        closeAllConnections: () => {
+          allClosed = true;
+        },
+      };
+
+      const mockScheduler = {
+        stop: () => {},
+      };
+
+      const mockDisconnectDB = async () => {
+        dbDisconnected = true;
+      };
+
+      const shutdownHandler = createShutdownHandler({
+        server: mockHangingServer as any,
+        recoveryScheduler: mockScheduler as any,
+        disconnectDB: mockDisconnectDB,
+        serverCloseTimeoutMs: 30,
+        drainTimeoutMs: 30,
+      });
+
+      const startTime = Date.now();
+      await shutdownHandler('SIGTERM');
+      const elapsedMs = Date.now() - startTime;
+
+      assert.equal(idleClosed, true, 'Must call closeIdleConnections when supported');
+      assert.equal(allClosed, true, 'Must call closeAllConnections when server close times out');
+      assert.equal(dbDisconnected, true, 'Must disconnect DB strictly after draining / bounded close');
+      assert.ok(elapsedMs < 2000, 'Must complete bounded shutdown within reasonable timeout');
+    });
+
+    // G. Centralized Error Logging & Expanded PII Redaction Tests
+    it('redactLogData redacts sensitive keys, tokens, and secrets in nested metadata', async () => {
+      const { redactLogData } = await import('../src/utils/logger.js');
+
+      const sensitivePayload = {
+        jwt_secret: 'super-secret-key-12345',
+        access_token: 'ey123456789.secret',
+        refresh_token: 'refresh_987654',
+        client_secret: 'oauth_client_secret_xyz',
+        currentPassword: 'CurrentPassword@2026',
+        newPassword: 'NewPassword@2026',
+        confirmPassword: 'NewPassword@2026',
+        dbUri: 'mongodb+srv://admin:pass@cluster.mongodb.net/production',
+      };
+
+      const redacted = redactLogData(sensitivePayload);
+      assert.equal(redacted.jwt_secret, '[REDACTED]');
+      assert.equal(redacted.access_token, '[REDACTED]');
+      assert.equal(redacted.refresh_token, '[REDACTED]');
+      assert.equal(redacted.client_secret, '[REDACTED]');
+      assert.equal(redacted.currentPassword, '[REDACTED]');
+      assert.equal(redacted.newPassword, '[REDACTED]');
+      assert.equal(redacted.confirmPassword, '[REDACTED]');
+      assert.equal(redacted.dbUri, '[REDACTED]');
+    });
+
+    it('redactLogData masks emails, phone numbers, mobile, and recipient contacts', async () => {
+      const { redactLogData } = await import('../src/utils/logger.js');
+
+      const contactPayload = {
+        customerEmail: 'deepika.patel@example.com',
+        userEmail: 'manager@bakery.org',
+        recipientEmail: 'order.confirmation@gmail.com',
+        customerPhone: '+919876543210',
+        mobile: '9123456789',
+        contact: '9988776655',
+        recipientEmailType: {
+          recipient: 'delivery.agent@deepscakeshop.in',
+        },
+        recipientPhoneType: {
+          recipient: '+91 98765 43210',
+        },
+      };
+
+      const redacted = redactLogData(contactPayload);
+      assert.ok(redacted.customerEmail.includes('d***@example.com'));
+      assert.ok(redacted.userEmail.includes('m***@bakery.org'));
+      assert.ok(redacted.recipientEmail.includes('o***@gmail.com'));
+      assert.ok(redacted.customerPhone.includes('******3210'));
+      assert.ok(redacted.mobile.includes('******6789'));
+      assert.ok(redacted.contact.includes('******6655'));
+      assert.ok(redacted.recipientEmailType.recipient.includes('d***@deepscakeshop.in'));
+      assert.ok(redacted.recipientPhoneType.recipient.includes('******3210'));
+    });
+
+    it('redactLogData recursively handles Error instances and custom error properties', async () => {
+      const { redactLogData } = await import('../src/utils/logger.js');
+
+      const customErr: any = new Error('Database connection failed');
+      customErr.password = 'DbPassword@123';
+      customErr.token = 'secret-session-token';
+      customErr.userEmail = 'admin@deepscakeshop.in';
+      customErr.nested = {
+        apiKey: 'secret_key_999',
+        customerPhone: '9876543210',
+      };
+
+      const redacted = redactLogData(customErr);
+      assert.equal(redacted.message, 'Database connection failed');
+      assert.equal(redacted.password, '[REDACTED]');
+      assert.equal(redacted.token, '[REDACTED]');
+      assert.ok(redacted.userEmail.includes('a***@deepscakeshop.in'));
+      assert.equal(redacted.nested.apiKey, '[REDACTED]');
+      assert.ok(redacted.nested.customerPhone.includes('******3210'));
+    });
+
+    it('error middleware logs through structured logger with correlation ID and does not leak secrets', async () => {
+      const express = (await import('express')).default;
+      const { errorHandler } = await import('../src/middlewares/error.middleware.js');
+      const testErrApp = express();
+
+      testErrApp.use((req, _res, next) => {
+        (req as any).correlationId = 'trace-err-test-999';
+        next();
+      });
+
+      testErrApp.get('/error-test', (_req, _res, next) => {
+        const err: any = new Error('Simulated test failure');
+        err.secretToken = 'leaked-token-123';
+        err.status = 500;
+        next(err);
+      });
+
+      testErrApp.use(errorHandler);
+
+      const res = await request(testErrApp).get('/error-test');
+      assert.equal(res.status, 500);
+      assert.equal(res.body.success, false);
+      assert.equal(res.body.correlationId, 'trace-err-test-999');
+      // Must not leak secretToken in response payload
+      assert.equal(res.body.secretToken, undefined);
+    });
+
+    // H. Proxy Trust Review Tests
+    it('configureTrustProxy supports direct-exposure (false/0) and reverse-proxy (true/1/numeric) modes safely', async () => {
+      const express = (await import('express')).default;
+      const { configureTrustProxy } = await import('../src/app.js');
+
+      const appZero = express();
+      configureTrustProxy(appZero, '0');
+      assert.equal(appZero.get('trust proxy'), false);
+
+      const appFalse = express();
+      configureTrustProxy(appFalse, 'false');
+      assert.equal(appFalse.get('trust proxy'), false);
+
+      const appOne = express();
+      configureTrustProxy(appOne, '1');
+      assert.equal(appOne.get('trust proxy'), 1);
+
+      const appTrue = express();
+      configureTrustProxy(appTrue, 'true');
+      assert.equal(appTrue.get('trust proxy'), 1);
+
+      const appUnknown = express();
+      configureTrustProxy(appUnknown, 'invalid-proxy-config');
+      assert.equal(appUnknown.get('trust proxy'), false);
     });
   });
 });

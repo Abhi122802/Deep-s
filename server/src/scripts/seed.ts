@@ -78,9 +78,14 @@ export async function seedInitialData(force = false): Promise<void> {
       email: 'admin@deepscakeshop.in',
       passwordHash,
       role: 'superadmin',
+      tokenVersion: 0,
     });
-    console.log(`✓ Default admin created: username="admin", email="admin@deepscakeshop.in"`);
-    console.log(`  (Default password: "${defaultPassword}")`);
+    console.log('✓ Default admin initialized: username="admin", email="admin@deepscakeshop.in"');
+    if (env.NODE_ENV === 'production') {
+      console.log('  [SECURITY ADVISORY] Production admin account seeded. Immediate password change required.');
+    } else {
+      console.log('  [Notice] Initial default development credentials configured.');
+    }
   } else {
     console.log('✓ Default admin already exists. Preserved.');
   }
