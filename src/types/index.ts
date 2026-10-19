@@ -28,6 +28,7 @@ export interface Cake {
   isFeatured?: boolean;
   preparationTimeHours: number;
   dietaryTags?: string[];
+  isAvailable?: boolean;
 }
 
 export interface CartItem {

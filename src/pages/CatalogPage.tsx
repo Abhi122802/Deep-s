@@ -1,7 +1,8 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import type { CakeCategory, WeightOption } from '../types';
+import type { Cake, CakeCategory, WeightOption } from '../types';
 import { DEMO_CAKES } from '../data/cakes';
+import { cakeService } from '../services/cakeService';
 import { ProductGrid } from '../components/product/ProductGrid';
 import {
   Search,
@@ -10,6 +11,7 @@ import {
   Sparkles,
   ChevronDown,
   X,
+  AlertCircle,
 } from 'lucide-react';
 import { EggBadge } from '../components/common/EggBadge';
 
@@ -46,6 +48,36 @@ export const CatalogPage: React.FC = () => {
   const [weightFilter, setWeightFilter] = useState<'all' | WeightOption>('all');
   const [sortBy, setSortBy] = useState<'featured' | 'price-low' | 'price-high' | 'rating' | 'bestseller'>('featured');
   const [isMobileFiltersOpen, setIsMobileFiltersOpen] = useState(false);
+
+  // Dynamic Catalog State
+  const [catalogCakes, setCatalogCakes] = useState<Cake[]>([]);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+  const [isFallback, setIsFallback] = useState<boolean>(false);
+
+  // Fetch catalog from backend API with fallback distinction
+  const fetchCatalog = useCallback(async () => {
+    setIsLoading(true);
+    setFetchError(null);
+    try {
+      const res = await cakeService.getCatalogResponse();
+      setCatalogCakes(res.cakes);
+      setIsFallback(res.isFallback);
+      if (res.error) {
+        setFetchError(res.error);
+      }
+    } catch {
+      setFetchError('Unable to connect to live catalog. Showing offline catalog.');
+      setIsFallback(true);
+      setCatalogCakes(DEMO_CAKES);
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchCatalog();
+  }, [fetchCatalog]);
 
   // Sync URL changes
   useEffect(() => {
@@ -89,9 +121,12 @@ export const CatalogPage: React.FC = () => {
     setSearchParams({});
   };
 
-  // Filter & sort logic
+  // Filter & sort logic grounded in the dynamic catalog
   const filteredCakes = useMemo(() => {
-    let list = [...DEMO_CAKES];
+    let list = [...catalogCakes];
+
+    // Filter out unavailable cakes from storefront catalog
+    list = list.filter((c) => c.isAvailable !== false);
 
     // Search
     if (searchTerm.trim()) {
@@ -119,7 +154,7 @@ export const CatalogPage: React.FC = () => {
 
     // Weight filter (all cakes have weight prices, but this allows specific pricing verification)
     if (weightFilter !== 'all') {
-      list = list.filter((c) => !!c.weightPrices[weightFilter]);
+      list = list.filter((c) => !!c.weightPrices?.[weightFilter]);
     }
 
     // Price
@@ -146,7 +181,7 @@ export const CatalogPage: React.FC = () => {
     }
 
     return list;
-  }, [category, searchTerm, eggPreference, weightFilter, maxPrice, sortBy]);
+  }, [catalogCakes, category, searchTerm, eggPreference, weightFilter, maxPrice, sortBy]);
 
   const hasActiveFilters =
     category !== 'All' ||
@@ -170,12 +205,12 @@ export const CatalogPage: React.FC = () => {
               Cake Catalog
             </h1>
             <p className="text-sm text-[#7E6355] mt-1">
-              Explore 14+ handcrafted cakes baked fresh with premium ingredients
+              Explore our handcrafted cakes baked fresh with premium ingredients
             </p>
           </div>
 
           <div className="text-xs text-[#7E6355]">
-            Showing <strong className="text-[#2B1810] font-bold">{filteredCakes.length}</strong> cakes available for 2-hour delivery
+            Showing <strong className="text-[#2B1810] font-bold">{filteredCakes.length}</strong> {filteredCakes.length === 1 ? 'cake' : 'cakes'} available for 2-hour delivery
           </div>
         </div>
 
@@ -375,11 +410,42 @@ export const CatalogPage: React.FC = () => {
           </aside>
 
           {/* Product Grid Area */}
-          <div className="lg:col-span-3">
-            <ProductGrid
-              cakes={filteredCakes}
-              onResetFilters={resetAllFilters}
-            />
+          <div className="lg:col-span-3 space-y-6">
+            {fetchError && (
+              <div className="bg-[#FFF4E5] border border-[#FFE2B3] text-[#7A4B00] px-4 py-3 rounded-2xl flex items-center justify-between gap-4 text-xs">
+                <div className="flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 text-[#D97706] shrink-0" />
+                  <span>{fetchError} {isFallback && '(Offline Demo Mode)'}</span>
+                </div>
+                <button
+                  onClick={fetchCatalog}
+                  className="px-3 py-1 bg-white border border-[#FFE2B3] hover:bg-[#FFFDF9] rounded-lg font-bold text-xs shrink-0 cursor-pointer"
+                >
+                  Retry
+                </button>
+              </div>
+            )}
+
+            {isLoading ? (
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6 animate-pulse">
+                {[1, 2, 3, 4, 5, 6, 7, 8].map((n) => (
+                  <div key={n} className="bg-white rounded-2xl border border-[#E8DDD7] p-4 space-y-3">
+                    <div className="aspect-square bg-stone-100 rounded-xl" />
+                    <div className="h-4 bg-stone-100 rounded-md w-3/4" />
+                    <div className="h-3 bg-stone-100 rounded-md w-1/2" />
+                    <div className="flex justify-between items-center pt-2">
+                      <div className="h-5 bg-stone-100 rounded-md w-16" />
+                      <div className="h-8 bg-stone-100 rounded-lg w-20" />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <ProductGrid
+                cakes={filteredCakes}
+                onResetFilters={resetAllFilters}
+              />
+            )}
           </div>
         </div>
       </div>

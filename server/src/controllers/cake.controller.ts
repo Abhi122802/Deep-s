@@ -90,7 +90,7 @@ export async function getCakes(req: Request, res: Response, next: NextFunction):
     }
 
     // Graceful fallback to centralized demo cakes if database connection is pending
-    let fallback = [...DEMO_CAKES];
+    let fallback = DEMO_CAKES.filter((c: any) => c.isAvailable !== false);
     if (searchTerm) {
       const term = searchTerm.toLowerCase();
       fallback = fallback.filter(
@@ -180,7 +180,11 @@ export async function getFeaturedCakes(_req: Request, res: Response, next: NextF
   try {
     if (isDbConnected()) {
       const cakes = await CakeModel.find({ isFeatured: true, isAvailable: true }).limit(8).lean();
-      res.json({ success: true, data: cakes });
+      const formatted = cakes.map((c: any) => ({
+        ...c,
+        id: c._id ? c._id.toString() : c.id,
+      }));
+      res.json({ success: true, data: formatted });
       return;
     }
     res.json({ success: true, data: DEMO_CAKES.filter((c) => c.isFeatured) });
@@ -193,7 +197,11 @@ export async function getBestSellers(_req: Request, res: Response, next: NextFun
   try {
     if (isDbConnected()) {
       const cakes = await CakeModel.find({ isBestSeller: true, isAvailable: true }).limit(8).lean();
-      res.json({ success: true, data: cakes });
+      const formatted = cakes.map((c: any) => ({
+        ...c,
+        id: c._id ? c._id.toString() : c.id,
+      }));
+      res.json({ success: true, data: formatted });
       return;
     }
     res.json({ success: true, data: DEMO_CAKES.filter((c) => c.isBestSeller) });

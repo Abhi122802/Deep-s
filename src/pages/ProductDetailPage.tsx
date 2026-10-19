@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
-import { DEMO_CAKES } from '../data/cakes';
 import type { Cake, WeightOption } from '../types';
 import { useCart } from '../context/CartContext';
 import { useWishlist } from '../context/WishlistContext';
@@ -32,6 +31,9 @@ export const ProductDetailPage: React.FC = () => {
   const { showToast } = useToast();
 
   const [cake, setCake] = useState<Cake | null>(null);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [relatedCakes, setRelatedCakes] = useState<Cake[]>([]);
   const [selectedWeight, setSelectedWeight] = useState<WeightOption>('0.5 kg');
   const [quantity, setQuantity] = useState<number>(1);
   const [customMessage, setCustomMessage] = useState<string>('');
@@ -47,22 +49,80 @@ export const ProductDetailPage: React.FC = () => {
 
   useEffect(() => {
     window.scrollTo(0, 0);
-    const found = DEMO_CAKES.find((c) => c.id === id || c.slug === id);
-    if (found) {
-      setCake(found);
-      setSelectedWeight('0.5 kg');
-      setQuantity(1);
-      setCustomMessage('');
-      setPincodeStatus(null);
+    let isCancelled = false;
+
+    async function loadCake() {
+      if (!id) return;
+      setIsLoading(true);
+      setLoadError(null);
+      try {
+        const found = await cakeService.getCakeById(id);
+        if (isCancelled) return;
+        if (found) {
+          setCake(found);
+          setSelectedWeight('0.5 kg');
+          setQuantity(1);
+          setCustomMessage('');
+          setPincodeStatus(null);
+
+          // Fetch related category cakes from dynamic catalog
+          cakeService
+            .getCakes({ category: found.category })
+            .then((list) => {
+              if (!isCancelled) {
+                setRelatedCakes(
+                  list.filter((c) => c.id !== found.id && c.slug !== found.slug && c.isAvailable !== false).slice(0, 4)
+                );
+              }
+            })
+            .catch(() => {});
+        } else {
+          setCake(null);
+        }
+      } catch (err: any) {
+        if (!isCancelled) {
+          setLoadError(err?.message || 'Failed to load cake details.');
+          setCake(null);
+        }
+      } finally {
+        if (!isCancelled) {
+          setIsLoading(false);
+        }
+      }
     }
+
+    loadCake();
+    return () => {
+      isCancelled = true;
+    };
   }, [id]);
+
+  if (isLoading) {
+    return (
+      <div className="bg-[#FDFBF7] py-8 sm:py-12 min-h-[70vh]">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 space-y-8 animate-pulse">
+          <div className="h-6 bg-stone-200 rounded-md w-36" />
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-10">
+            <div className="lg:col-span-6 aspect-square bg-stone-200 rounded-3xl" />
+            <div className="lg:col-span-6 space-y-6">
+              <div className="h-8 bg-stone-200 rounded-md w-3/4" />
+              <div className="h-4 bg-stone-200 rounded-md w-1/2" />
+              <div className="h-10 bg-stone-200 rounded-md w-1/3" />
+              <div className="h-24 bg-stone-200 rounded-xl" />
+              <div className="h-14 bg-stone-200 rounded-2xl" />
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if (!cake) {
     return (
       <div className="min-h-[60vh] flex flex-col items-center justify-center text-center p-6 bg-[#FDFBF7]">
         <h2 className="font-serif text-2xl font-bold text-[#2B1810]">Cake Not Found</h2>
         <p className="text-sm text-[#7E6355] mt-2 mb-6">
-          The requested cake may have been moved or is currently out of seasonal rotation.
+          {loadError || 'The requested cake may have been moved or is currently out of seasonal rotation.'}
         </p>
         <Link
           to="/cakes"
@@ -111,10 +171,7 @@ export const ProductDetailPage: React.FC = () => {
     }
   };
 
-  // Related cakes in same category
-  const relatedCakes = DEMO_CAKES.filter(
-    (c) => c.category === cake.category && c.id !== cake.id
-  ).slice(0, 4);
+  const isAvailable = cake.isAvailable !== false;
 
   return (
     <div className="bg-[#FDFBF7] py-8 sm:py-12">
@@ -160,6 +217,11 @@ export const ProductDetailPage: React.FC = () => {
                 <span className="px-3 py-1 rounded-full bg-white/95 backdrop-blur-xs text-[#2B1810] text-xs font-semibold shadow-xs">
                   {cake.category} Cake
                 </span>
+                {!isAvailable && (
+                  <span className="px-3 py-1 rounded-full bg-red-600 text-white text-xs font-bold uppercase tracking-wider flex items-center gap-1.5 shadow-md">
+                    Currently Unavailable
+                  </span>
+                )}
               </div>
 
               {/* Wishlist Button */}
@@ -328,12 +390,19 @@ export const ProductDetailPage: React.FC = () => {
 
               <button
                 type="button"
+                disabled={!isAvailable}
                 onClick={handleAddToCart}
-                className="flex-1 py-4 px-6 rounded-2xl bg-[#2B1810] hover:bg-[#3D2314] text-[#FFFDF9] font-bold text-sm tracking-wide flex items-center justify-center gap-2.5 shadow-lg hover:shadow-xl transition-all cursor-pointer active:scale-98"
+                className={`flex-1 py-4 px-6 rounded-2xl font-bold text-sm tracking-wide flex items-center justify-center gap-2.5 transition-all ${
+                  isAvailable
+                    ? 'bg-[#2B1810] hover:bg-[#3D2314] text-[#FFFDF9] shadow-lg hover:shadow-xl cursor-pointer active:scale-98'
+                    : 'bg-stone-300 text-stone-500 cursor-not-allowed shadow-none'
+                }`}
               >
-                <ShoppingBag className="w-5 h-5 text-[#DFBF77]" />
+                <ShoppingBag className={`w-5 h-5 ${isAvailable ? 'text-[#DFBF77]' : 'text-stone-400'}`} />
                 <span>
-                  Add To Bakery Cart • ₹{(currentPrice * quantity).toLocaleString('en-IN')}
+                  {isAvailable
+                    ? `Add To Bakery Cart • ₹${(currentPrice * quantity).toLocaleString('en-IN')}`
+                    : 'Currently Unavailable'}
                 </span>
               </button>
             </div>

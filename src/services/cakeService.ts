@@ -1,6 +1,35 @@
 import { DEMO_CAKES } from '../data/cakes';
 import type { Cake, CakeCategory, CustomCakeInquiry, FilterState } from '../types';
-import { api } from './api';
+import { api, ApiError } from './api';
+
+export interface CatalogResult {
+  cakes: Cake[];
+  isFallback: boolean;
+  error: string | null;
+}
+
+export function normalizeCake(cake: any): Cake {
+  const id = cake.id || (cake._id ? cake._id.toString() : '');
+  const basePrice = Number(cake.basePrice) || 0;
+  return {
+    ...cake,
+    id,
+    basePrice,
+    weightPrices: cake.weightPrices || {
+      '0.5 kg': basePrice,
+      '1 kg': Math.round(basePrice * 1.88),
+      '1.5 kg': Math.round(basePrice * 2.75),
+      '2 kg': Math.round(basePrice * 3.63),
+    },
+    isEggless: Boolean(cake.isEggless),
+    rating: typeof cake.rating === 'number' ? cake.rating : 4.8,
+    reviewsCount: typeof cake.reviewsCount === 'number' ? cake.reviewsCount : 0,
+    ingredients: Array.isArray(cake.ingredients) ? cake.ingredients : [],
+    dietaryTags: Array.isArray(cake.dietaryTags) ? cake.dietaryTags : [],
+    preparationTimeHours: Number(cake.preparationTimeHours) || 2,
+    isAvailable: cake.isAvailable !== undefined ? Boolean(cake.isAvailable) : true,
+  };
+}
 
 export interface OrderCreationPayload {
   customer: {
@@ -39,10 +68,9 @@ export interface OrderCreationResult {
 
 export const cakeService = {
   /**
-   * Fetch all cakes with server-side query filters, sorting, and pagination
-   * Falls back seamlessly to centralized demo data if backend server is not running
+   * Fetch all cakes from backend with metadata, distinguishing API failure from empty catalog
    */
-  async getCakes(filter?: Partial<FilterState>): Promise<Cake[]> {
+  async getCatalogResponse(filter?: Partial<FilterState>): Promise<CatalogResult> {
     const params = new URLSearchParams();
 
     if (filter) {
@@ -70,63 +98,91 @@ export const cakeService = {
 
     try {
       const res = await api.get<{ success: boolean; data: Cake[] }>(`cakes${queryStr}`);
-      if (res && res.success && Array.isArray(res.data) && res.data.length > 0) {
-        return res.data;
+      if (res && res.success && Array.isArray(res.data)) {
+        return {
+          cakes: res.data.map(normalizeCake),
+          isFallback: false,
+          error: null,
+        };
       }
-    } catch {
-      // Graceful fallback to client demo catalog if server is not reachable
+    } catch (err: any) {
+      // Genuine network or server failure -> use static demo catalog fallback
+      console.warn('[cakeService] Failed to reach backend catalog, falling back to static catalog:', err);
+      let result = DEMO_CAKES.map(normalizeCake);
+      if (filter) {
+        if (filter.search && filter.search.trim()) {
+          const q = filter.search.toLowerCase().trim();
+          result = result.filter(
+            (c) =>
+              c.name.toLowerCase().includes(q) ||
+              c.flavor.toLowerCase().includes(q) ||
+              c.category.toLowerCase().includes(q) ||
+              c.description.toLowerCase().includes(q)
+          );
+        }
+        if (filter.category && filter.category !== 'All') {
+          result = result.filter((c) => c.category === filter.category);
+        }
+        if (filter.eggPreference === 'eggless') {
+          result = result.filter((c) => c.isEggless);
+        } else if (filter.eggPreference === 'contains-egg') {
+          result = result.filter((c) => !c.isEggless);
+        }
+        if (filter.maxPrice && filter.maxPrice > 0) {
+          result = result.filter((c) => c.basePrice <= filter.maxPrice!);
+        }
+        if (filter.sortBy === 'price-low') {
+          result.sort((a, b) => a.basePrice - b.basePrice);
+        } else if (filter.sortBy === 'price-high') {
+          result.sort((a, b) => b.basePrice - a.basePrice);
+        } else if (filter.sortBy === 'rating') {
+          result.sort((a, b) => b.rating - a.rating);
+        } else if (filter.sortBy === 'bestseller') {
+          result.sort((a, b) => (b.isBestSeller ? 1 : 0) - (a.isBestSeller ? 1 : 0));
+        }
+      }
+
+      return {
+        cakes: result,
+        isFallback: true,
+        error: 'Unable to connect to live catalog. Showing offline catalog.',
+      };
     }
 
-    // Client fallback resolver
-    let result = [...DEMO_CAKES];
-    if (!filter) return result;
+    return {
+      cakes: [],
+      isFallback: false,
+      error: null,
+    };
+  },
 
-    if (filter.search && filter.search.trim()) {
-      const q = filter.search.toLowerCase().trim();
-      result = result.filter(
-        (c) =>
-          c.name.toLowerCase().includes(q) ||
-          c.flavor.toLowerCase().includes(q) ||
-          c.category.toLowerCase().includes(q) ||
-          c.description.toLowerCase().includes(q)
-      );
-    }
-    if (filter.category && filter.category !== 'All') {
-      result = result.filter((c) => c.category === filter.category);
-    }
-    if (filter.eggPreference === 'eggless') {
-      result = result.filter((c) => c.isEggless);
-    } else if (filter.eggPreference === 'contains-egg') {
-      result = result.filter((c) => !c.isEggless);
-    }
-    if (filter.maxPrice && filter.maxPrice > 0) {
-      result = result.filter((c) => c.basePrice <= filter.maxPrice!);
-    }
-    if (filter.sortBy === 'price-low') {
-      result.sort((a, b) => a.basePrice - b.basePrice);
-    } else if (filter.sortBy === 'price-high') {
-      result.sort((a, b) => b.basePrice - a.basePrice);
-    } else if (filter.sortBy === 'rating') {
-      result.sort((a, b) => b.rating - a.rating);
-    } else if (filter.sortBy === 'bestseller') {
-      result.sort((a, b) => (b.isBestSeller ? 1 : 0) - (a.isBestSeller ? 1 : 0));
-    }
-    return result;
+  /**
+   * Fetch all cakes with server-side query filters, sorting, and pagination
+   * Falls back seamlessly to centralized demo data only if backend server is unreachable
+   */
+  async getCakes(filter?: Partial<FilterState>): Promise<Cake[]> {
+    const res = await this.getCatalogResponse(filter);
+    return res.cakes;
   },
 
   /**
    * Fetch single cake by ID or slug via API
+   * Does not resurrect deleted cakes if API returns a clean 404
    */
   async getCakeById(idOrSlug: string): Promise<Cake | undefined> {
     try {
       const res = await api.get<{ success: boolean; data: Cake }>(`cakes/${idOrSlug}`);
       if (res && res.success && res.data) {
-        return res.data;
+        return normalizeCake(res.data);
       }
-    } catch {
-      // Fallback
+    } catch (err: any) {
+      if (err instanceof ApiError && err.statusCode === 404) {
+        return undefined;
+      }
+      console.warn(`[cakeService] Failed to fetch cake ${idOrSlug}, trying offline fallback:`, err);
     }
-    return DEMO_CAKES.find((c) => c.id === idOrSlug || c.slug === idOrSlug);
+    const found = DEMO_CAKES.find((c) => c.id === idOrSlug || c.slug === idOrSlug);
+    return found ? normalizeCake(found) : undefined;
   },
 
   /**
@@ -135,13 +191,13 @@ export const cakeService = {
   async getFeaturedCakes(): Promise<Cake[]> {
     try {
       const res = await api.get<{ success: boolean; data: Cake[] }>('cakes/featured');
-      if (res && res.success && Array.isArray(res.data) && res.data.length > 0) {
-        return res.data;
+      if (res && res.success && Array.isArray(res.data)) {
+        return res.data.map(normalizeCake);
       }
-    } catch {
-      // Fallback
+    } catch (err) {
+      console.warn('[cakeService] Failed to fetch featured cakes, using offline fallback:', err);
     }
-    return DEMO_CAKES.filter((c) => c.isFeatured);
+    return DEMO_CAKES.filter((c) => c.isFeatured).map(normalizeCake);
   },
 
   /**
@@ -150,13 +206,13 @@ export const cakeService = {
   async getBestSellers(): Promise<Cake[]> {
     try {
       const res = await api.get<{ success: boolean; data: Cake[] }>('cakes/bestsellers');
-      if (res && res.success && Array.isArray(res.data) && res.data.length > 0) {
-        return res.data;
+      if (res && res.success && Array.isArray(res.data)) {
+        return res.data.map(normalizeCake);
       }
-    } catch {
-      // Fallback
+    } catch (err) {
+      console.warn('[cakeService] Failed to fetch bestsellers, using offline fallback:', err);
     }
-    return DEMO_CAKES.filter((c) => c.isBestSeller);
+    return DEMO_CAKES.filter((c) => c.isBestSeller).map(normalizeCake);
   },
 
   /**
@@ -164,14 +220,14 @@ export const cakeService = {
    */
   async getCakesByCategory(category: CakeCategory): Promise<Cake[]> {
     try {
-      const res = await api.get<{ success: boolean; data: Cake[] }>(`cakes?category=${category}`);
-      if (res && res.success && Array.isArray(res.data) && res.data.length > 0) {
-        return res.data;
+      const res = await api.get<{ success: boolean; data: Cake[] }>(`cakes?category=${encodeURIComponent(category)}`);
+      if (res && res.success && Array.isArray(res.data)) {
+        return res.data.map(normalizeCake);
       }
-    } catch {
-      // Fallback
+    } catch (err) {
+      console.warn(`[cakeService] Failed to fetch cakes for category ${category}, using offline fallback:`, err);
     }
-    return DEMO_CAKES.filter((c) => c.category === category);
+    return DEMO_CAKES.filter((c) => c.category === category).map(normalizeCake);
   },
 
   /**

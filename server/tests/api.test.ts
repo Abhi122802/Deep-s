@@ -5589,11 +5589,184 @@ describe('Deep’s Cake Shop — Phase 2 Backend API Test Suite', () => {
 
         const shutdown = createShutdownHandler({
           webhookRecoveryScheduler: mockWebhookScheduler as any,
+          disconnectDB: async () => {},
           onExit: () => {},
         });
 
         await shutdown('SIGTERM');
         assert.equal(stopped, true, 'Shutdown handler must stop webhook recovery scheduler');
+      });
+    });
+
+    describe('24. Dynamic Storefront Catalog & Admin Synchronization', () => {
+      let adminToken: string;
+      const syncSlug = `sync-cake-${Date.now()}`;
+      let createdCakeId: string;
+
+      beforeEach(async () => {
+        const { env } = await import('../src/config/env.js');
+        const { AdminModel, MEMORY_ADMIN } = await import('../src/models/Admin.js');
+        const { isDbConnected } = await import('../src/config/db.js');
+        let currentVersion = MEMORY_ADMIN.tokenVersion ?? 0;
+        let adminId = MEMORY_ADMIN.id;
+        if (isDbConnected()) {
+          const dbAdmin = await AdminModel.findOne({ username: 'admin' }).select('_id tokenVersion').lean();
+          if (dbAdmin) {
+            currentVersion = dbAdmin.tokenVersion ?? 0;
+            adminId = dbAdmin._id.toString();
+          }
+        }
+        const jwt = (await import('jsonwebtoken')).default;
+        adminToken = jwt.sign(
+          { id: adminId, username: 'admin', role: 'superadmin', tokenVersion: currentVersion },
+          env.JWT_SECRET,
+          { expiresIn: '1h' }
+        );
+      });
+
+      it('GET /api/cakes returns 200 with id on all items (mapped from _id or id)', async () => {
+        const res = await request(app).get('/api/cakes');
+        assert.equal(res.status, 200);
+        assert.equal(res.body.success, true);
+        assert.ok(Array.isArray(res.body.data));
+        assert.ok(res.body.data.length > 0);
+        for (const cake of res.body.data) {
+          assert.ok(cake.id, `Cake ${cake.name} must have a defined id string`);
+          assert.equal(typeof cake.id, 'string');
+        }
+      });
+
+      it('GET /api/cakes/featured returns 200 with formatted id field on all items', async () => {
+        const res = await request(app).get('/api/cakes/featured');
+        assert.equal(res.status, 200);
+        assert.equal(res.body.success, true);
+        assert.ok(Array.isArray(res.body.data));
+        for (const cake of res.body.data) {
+          assert.ok(cake.id, 'Featured cake must have formatted id string');
+          assert.equal(typeof cake.id, 'string');
+        }
+      });
+
+      it('GET /api/cakes/bestsellers returns 200 with formatted id field on all items', async () => {
+        const res = await request(app).get('/api/cakes/bestsellers');
+        assert.equal(res.status, 200);
+        assert.equal(res.body.success, true);
+        assert.ok(Array.isArray(res.body.data));
+        for (const cake of res.body.data) {
+          assert.ok(cake.id, 'Bestseller cake must have formatted id string');
+          assert.equal(typeof cake.id, 'string');
+        }
+      });
+
+      it('admin cake creation immediately surfaces on public GET /api/cakes and GET /api/cakes/:id', async () => {
+        const payload = {
+          name: 'Pistachio Raspberry Entremet',
+          slug: syncSlug,
+          category: 'Designer',
+          basePrice: 1050,
+          weightPrices: {
+            '0.5 kg': 1050,
+            '1 kg': 1999,
+            '1.5 kg': 2899,
+            '2 kg': 3799,
+          },
+          isEggless: true,
+          image: 'https://images.unsplash.com/photo-1578985545062-69928b1d9587',
+          description: 'Bronte pistachio mousse layered with tangy raspberry gelee.',
+          flavor: 'Bronte Pistachio & Wild Raspberry',
+          ingredients: ['Bronte Pistachio', 'Wild Raspberries', 'White Chocolate'],
+          isBestSeller: false,
+          isFeatured: true,
+          preparationTimeHours: 3,
+          dietaryTags: ['100% Eggless', 'Artisanal'],
+          isAvailable: true,
+        };
+
+        const createRes = await request(app)
+          .post('/api/admin/cakes')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send(payload);
+
+        assert.equal(createRes.status, 201);
+        assert.equal(createRes.body.success, true);
+        createdCakeId = createRes.body.data._id || createRes.body.data.id;
+        assert.ok(createdCakeId);
+
+        // Verify storefront catalog GET /api/cakes returns the new cake
+        const catalogRes = await request(app).get('/api/cakes?search=Pistachio');
+        assert.equal(catalogRes.status, 200);
+        assert.equal(catalogRes.body.success, true);
+        const match = catalogRes.body.data.find((c: any) => c.slug === syncSlug || c.id === createdCakeId);
+        assert.ok(match, 'Newly created admin cake must appear in customer storefront catalog');
+        assert.equal(match.name, 'Pistachio Raspberry Entremet');
+
+        // Verify storefront detail GET /api/cakes/:id returns the new cake
+        const detailRes = await request(app).get(`/api/cakes/${syncSlug}`);
+        assert.equal(detailRes.status, 200);
+        assert.equal(detailRes.body.success, true);
+        assert.equal(detailRes.body.data.name, 'Pistachio Raspberry Entremet');
+        assert.equal(detailRes.body.data.basePrice, 1050);
+      });
+
+      it('admin price update propagates to public GET /api/cakes/:id', async () => {
+        const updateRes = await request(app)
+          .put(`/api/admin/cakes/${createdCakeId}`)
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({
+            basePrice: 1199,
+            weightPrices: {
+              '0.5 kg': 1199,
+              '1 kg': 2199,
+              '1.5 kg': 3099,
+              '2 kg': 3999,
+            },
+          });
+
+        assert.equal(updateRes.status, 200);
+        assert.equal(updateRes.body.success, true);
+
+        // Storefront detail reflects updated price
+        const detailRes = await request(app).get(`/api/cakes/${syncSlug}`);
+        assert.equal(detailRes.status, 200);
+        assert.equal(detailRes.body.data.basePrice, 1199);
+      });
+
+      it('admin setting isAvailable: false removes cake from public catalog GET /api/cakes', async () => {
+        const toggleRes = await request(app)
+          .patch(`/api/admin/cakes/${createdCakeId}/availability`)
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({ isAvailable: false });
+
+        assert.equal(toggleRes.status, 200);
+        assert.equal(toggleRes.body.success, true);
+
+        // Public storefront catalog must exclude unavailable cake
+        const catalogRes = await request(app).get('/api/cakes?search=Pistachio');
+        assert.equal(catalogRes.status, 200);
+        const foundInPublic = catalogRes.body.data.some((c: any) => c.slug === syncSlug || c.id === createdCakeId);
+        assert.equal(foundInPublic, false, 'Unavailable cake must not appear in public customer catalog');
+      });
+
+      it('admin cake deletion causes public GET /api/cakes/:id to return 404', async () => {
+        const deleteRes = await request(app)
+          .delete(`/api/admin/cakes/${createdCakeId}`)
+          .set('Authorization', `Bearer ${adminToken}`);
+
+        assert.equal(deleteRes.status, 200);
+        assert.equal(deleteRes.body.success, true);
+
+        // Public storefront detail must return 404 Not Found
+        const detailRes = await request(app).get(`/api/cakes/${createdCakeId}`);
+        assert.equal(detailRes.status, 404);
+        assert.equal(detailRes.body.success, false);
+      });
+
+      it('public GET /api/cakes returns valid empty array [] when search has no matches (not static demo cakes)', async () => {
+        const res = await request(app).get('/api/cakes?search=definitely_no_such_cake_xyz_nonexistent');
+        assert.equal(res.status, 200);
+        assert.equal(res.body.success, true);
+        assert.deepEqual(res.body.data, []);
+        assert.equal(res.body.pagination.total, 0);
       });
     });
 });

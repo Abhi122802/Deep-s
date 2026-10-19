@@ -1,6 +1,8 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { Link } from 'react-router-dom';
+import type { Cake } from '../../types';
 import { DEMO_CAKES } from '../../data/cakes';
+import { cakeService } from '../../services/cakeService';
 import { ProductCard } from '../product/ProductCard';
 import { ArrowRight, Award } from 'lucide-react';
 
@@ -8,13 +10,47 @@ type TabType = 'all' | 'bestsellers' | 'eggless' | 'chocolate';
 
 export const FeaturedSection: React.FC = () => {
   const [activeTab, setActiveTab] = useState<TabType>('all');
+  const [cakes, setCakes] = useState<Cake[]>([]);
+  const [isLoading, setIsLoading] = useState<boolean>(true);
 
-  const filteredCakes = DEMO_CAKES.filter((cake) => {
-    if (activeTab === 'bestsellers') return cake.isBestSeller;
-    if (activeTab === 'eggless') return cake.isEggless;
-    if (activeTab === 'chocolate') return cake.category === 'Chocolate';
-    return cake.isFeatured;
-  }).slice(0, 8);
+  useEffect(() => {
+    let isCancelled = false;
+
+    async function loadCakes() {
+      setIsLoading(true);
+      try {
+        const data = await cakeService.getCakes();
+        if (!isCancelled) {
+          setCakes(data.filter((c) => c.isAvailable !== false));
+        }
+      } catch {
+        if (!isCancelled) {
+          setCakes(DEMO_CAKES);
+        }
+      } finally {
+        if (!isCancelled) {
+          setIsLoading(false);
+        }
+      }
+    }
+
+    loadCakes();
+    return () => {
+      isCancelled = true;
+    };
+  }, []);
+
+  const filteredCakes = useMemo(() => {
+    const source = cakes.length > 0 ? cakes : (isLoading ? [] : DEMO_CAKES);
+    return source
+      .filter((cake) => {
+        if (activeTab === 'bestsellers') return cake.isBestSeller;
+        if (activeTab === 'eggless') return cake.isEggless;
+        if (activeTab === 'chocolate') return cake.category === 'Chocolate';
+        return cake.isFeatured;
+      })
+      .slice(0, 8);
+  }, [cakes, activeTab, isLoading]);
 
   return (
     <section className="py-16 bg-[#FDFBF7]">
@@ -80,11 +116,27 @@ export const FeaturedSection: React.FC = () => {
         </div>
 
         {/* Product Cards Grid */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
-          {filteredCakes.map((cake) => (
-            <ProductCard key={cake.id} cake={cake} />
-          ))}
-        </div>
+        {isLoading && cakes.length === 0 ? (
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6 animate-pulse">
+            {[1, 2, 3, 4].map((n) => (
+              <div key={n} className="bg-white rounded-2xl border border-[#E8DDD7] p-4 space-y-3">
+                <div className="aspect-square bg-stone-100 rounded-xl" />
+                <div className="h-4 bg-stone-100 rounded-md w-3/4" />
+                <div className="h-3 bg-stone-100 rounded-md w-1/2" />
+                <div className="flex justify-between items-center pt-2">
+                  <div className="h-5 bg-stone-100 rounded-md w-16" />
+                  <div className="h-8 bg-stone-100 rounded-lg w-20" />
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+            {filteredCakes.map((cake) => (
+              <ProductCard key={cake.id} cake={cake} />
+            ))}
+          </div>
+        )}
 
         {/* Bottom CTA */}
         <div className="mt-12 text-center">
@@ -92,7 +144,7 @@ export const FeaturedSection: React.FC = () => {
             to="/cakes"
             className="inline-flex items-center gap-2 px-8 py-3.5 rounded-full bg-white border border-[#E8DDD7] hover:border-[#C5A059] text-[#2B1810] hover:text-[#C5A059] text-sm font-bold shadow-xs hover:shadow-md transition-all group cursor-pointer"
           >
-            <span>Explore All 14+ Handcrafted Cakes</span>
+            <span>Explore All Handcrafted Cakes</span>
             <ArrowRight className="w-4 h-4 group-hover:translate-x-1 transition-transform text-[#C5A059]" />
           </Link>
         </div>

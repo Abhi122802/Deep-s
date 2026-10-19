@@ -18,12 +18,14 @@ export const ProductCard: React.FC<ProductCardProps> = ({ cake }) => {
   const { addItem } = useCart();
   const { isInWishlist, toggleWishlist } = useWishlist();
 
+  const isAvailable = cake.isAvailable !== false;
   const isFavorited = isInWishlist(cake.id);
   const currentPrice = cake.weightPrices[selectedWeight] || cake.basePrice;
 
   const handleAddToCart = (e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    if (!isAvailable) return;
     addItem(cake, selectedWeight, 1);
   };
 
@@ -57,6 +59,11 @@ export const ProductCard: React.FC<ProductCardProps> = ({ cake }) => {
           <span className="px-2.5 py-0.5 rounded-full bg-white/95 backdrop-blur-xs text-[#2B1810] text-[11px] font-semibold shadow-xs">
             {cake.category}
           </span>
+          {!isAvailable && (
+            <span className="px-2.5 py-0.5 rounded-full bg-red-600 text-white text-[10px] font-bold tracking-wider uppercase shadow-xs">
+              Out of Stock
+            </span>
+          )}
         </div>
 
         {/* Wishlist Button */}
@@ -142,12 +149,17 @@ export const ProductCard: React.FC<ProductCardProps> = ({ cake }) => {
           </div>
 
           <button
+            disabled={!isAvailable}
             onClick={handleAddToCart}
-            className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#2B1810] hover:bg-[#3D2314] text-[#FFFDF9] text-xs font-bold transition-all shadow-xs group/btn cursor-pointer active:scale-95"
-            aria-label={`Add ${cake.name} (${selectedWeight}) to cart`}
+            className={`flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold transition-all shadow-xs group/btn ${
+              isAvailable
+                ? 'bg-[#2B1810] hover:bg-[#3D2314] text-[#FFFDF9] cursor-pointer active:scale-95'
+                : 'bg-stone-300 text-stone-500 cursor-not-allowed shadow-none'
+            }`}
+            aria-label={isAvailable ? `Add ${cake.name} (${selectedWeight}) to cart` : `${cake.name} is currently out of stock`}
           >
-            <ShoppingBag className="w-3.5 h-3.5 text-[#DFBF77] group-hover/btn:scale-110 transition-transform" />
-            <span>Add</span>
+            <ShoppingBag className={`w-3.5 h-3.5 ${isAvailable ? 'text-[#DFBF77] group-hover/btn:scale-110 transition-transform' : 'text-stone-400'}`} />
+            <span>{isAvailable ? 'Add' : 'Out of Stock'}</span>
           </button>
         </div>
       </div>
