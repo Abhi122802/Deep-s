@@ -2970,10 +2970,14 @@ describe('Deep’s Cake Shop — Phase 2 Backend API Test Suite', () => {
         },
       };
 
+      let exitCode1: number | null = null;
       const shutdownHandler = createShutdownHandler({
         server: mockServer as any,
         recoveryScheduler: mockScheduler as any,
         drainTimeoutMs: 50,
+        onExit: (code) => {
+          exitCode1 = code;
+        },
       });
 
       // Call twice with different signals
@@ -2983,6 +2987,7 @@ describe('Deep’s Cake Shop — Phase 2 Backend API Test Suite', () => {
       // Assert idempotent execution: close and stop called exactly once
       assert.equal(serverClosedCount, 1);
       assert.equal(schedulerStoppedCount, 1);
+      assert.equal(exitCode1, 0);
     });
 
     it('createShutdownHandler closes idle connections and enforces bounded timeout if server.close hangs', async () => {
@@ -2991,6 +2996,7 @@ describe('Deep’s Cake Shop — Phase 2 Backend API Test Suite', () => {
       let idleClosed = false;
       let allClosed = false;
       let dbDisconnected = false;
+      let exitCode2: number | null = null;
 
       const mockHangingServer = {
         close: (_cb?: (err?: Error) => void) => {
@@ -3018,6 +3024,9 @@ describe('Deep’s Cake Shop — Phase 2 Backend API Test Suite', () => {
         disconnectDB: mockDisconnectDB,
         serverCloseTimeoutMs: 30,
         drainTimeoutMs: 30,
+        onExit: (code) => {
+          exitCode2 = code;
+        },
       });
 
       const startTime = Date.now();
@@ -3027,6 +3036,7 @@ describe('Deep’s Cake Shop — Phase 2 Backend API Test Suite', () => {
       assert.equal(idleClosed, true, 'Must call closeIdleConnections when supported');
       assert.equal(allClosed, true, 'Must call closeAllConnections when server close times out');
       assert.equal(dbDisconnected, true, 'Must disconnect DB strictly after draining / bounded close');
+      assert.equal(exitCode2, 0);
       assert.ok(elapsedMs < 2000, 'Must complete bounded shutdown within reasonable timeout');
     });
 
@@ -3159,4 +3169,1507 @@ describe('Deep’s Cake Shop — Phase 2 Backend API Test Suite', () => {
       assert.equal(appUnknown.get('trust proxy'), false);
     });
   });
+
+  // ============================================================================
+  // Phase 5, Milestone 2, Work Item 1 — Provider Configuration and Raw-Body Capture
+  // ============================================================================
+  describe('18. Provider Configuration and Raw-Body Capture (Phase 5, Milestone 2, Work Item 1)', () => {
+      // 1. Environment Defaults
+      it('exports safe defaults for SendGrid webhook key, Twilio WhatsApp, and Public API URL', async () => {
+        const { env } = await import('../src/config/env.js');
+        assert.equal(env.SENDGRID_WEBHOOK_VERIFICATION_KEY, '');
+        assert.equal(env.TWILIO_WHATSAPP_NUMBER, '');
+        assert.equal(env.PUBLIC_API_URL, '');
+        assert.equal(env.NOTIFICATION_MODE, 'mock');
+      });
+
+      // 2. Format validation helpers
+      it('validateSendgridWebhookKey validates base64 ECDSA public key format and length', async () => {
+        const { validateSendgridWebhookKey } = await import('../src/config/env.js');
+
+        // Optional when empty or undefined
+        assert.equal(validateSendgridWebhookKey('').valid, true);
+        assert.equal(validateSendgridWebhookKey(undefined).valid, true);
+
+        // Valid base64 key of >= 32 chars
+        const validKey = 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE1234567890abcdef1234567890abcdef==';
+        const validRes = validateSendgridWebhookKey(validKey);
+        assert.equal(validRes.valid, true);
+
+        // Invalid: too short (< 32 chars)
+        const shortRes = validateSendgridWebhookKey('dG9vX3Nob3J0');
+        assert.equal(shortRes.valid, false);
+        assert.ok(shortRes.error?.includes('at least 32 characters'));
+        // Must not leak key value
+        assert.ok(!shortRes.error?.includes('dG9vX3Nob3J0'));
+
+        // Invalid: non-base64 characters
+        const invalidCharsRes = validateSendgridWebhookKey('MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE@#$%^&*()_+');
+        assert.equal(invalidCharsRes.valid, false);
+        assert.ok(invalidCharsRes.error?.includes('valid base64-encoded'));
+        assert.ok(!invalidCharsRes.error?.includes('@#$%'));
+      });
+
+      it('validateTwilioWhatsAppNumber validates E.164 phone format and whatsapp: prefix', async () => {
+        const { validateTwilioWhatsAppNumber } = await import('../src/config/env.js');
+
+        // Optional when empty or undefined
+        assert.equal(validateTwilioWhatsAppNumber('').valid, true);
+        assert.equal(validateTwilioWhatsAppNumber(undefined).valid, true);
+
+        // Valid numbers with and without prefix
+        assert.equal(validateTwilioWhatsAppNumber('+14155238886').valid, true);
+        assert.equal(validateTwilioWhatsAppNumber('whatsapp:+14155238886').valid, true);
+        assert.equal(validateTwilioWhatsAppNumber('+919876543210').valid, true);
+        assert.equal(validateTwilioWhatsAppNumber('whatsapp:+919876543210').valid, true);
+
+        // Invalid: missing leading +, invalid chars, or too short
+        const invalid1 = validateTwilioWhatsAppNumber('14155238886');
+        assert.equal(invalid1.valid, false);
+        assert.ok(invalid1.error?.includes('valid E.164 format'));
+        assert.ok(!invalid1.error?.includes('14155238886'));
+
+        const invalid2 = validateTwilioWhatsAppNumber('whatsapp:invalid-phone');
+        assert.equal(invalid2.valid, false);
+        assert.ok(!invalid2.error?.includes('invalid-phone'));
+
+        const invalid3 = validateTwilioWhatsAppNumber('+0123456789'); // Leading 0 invalid E.164
+        assert.equal(invalid3.valid, false);
+      });
+
+      it('validatePublicApiUrl validates URL syntax and enforces HTTPS in production', async () => {
+        const { validatePublicApiUrl } = await import('../src/config/env.js');
+
+        // Optional when empty or undefined
+        assert.equal(validatePublicApiUrl('').valid, true);
+        assert.equal(validatePublicApiUrl(undefined).valid, true);
+
+        // Valid URLs in development
+        assert.equal(validatePublicApiUrl('http://localhost:5000', 'development').valid, true);
+        assert.equal(validatePublicApiUrl('https://api.deepscakeshop.in', 'development').valid, true);
+
+        // Production mode enforces HTTPS
+        const prodHttp = validatePublicApiUrl('http://api.deepscakeshop.in', 'production');
+        assert.equal(prodHttp.valid, false);
+        assert.ok(prodHttp.error?.includes('https:// in production mode'));
+
+        // Production mode rejects localhost / loopback addresses
+        const prodLocalhost = validatePublicApiUrl('https://localhost:5000', 'production');
+        assert.equal(prodLocalhost.valid, false);
+        assert.ok(prodLocalhost.error?.includes('localhost or loopback address'));
+
+        const prodLoopbackIp = validatePublicApiUrl('https://127.0.0.1:5000', 'production');
+        assert.equal(prodLoopbackIp.valid, false);
+        assert.ok(prodLoopbackIp.error?.includes('localhost or loopback address'));
+
+        // Production mode rejects embedded credentials
+        const prodCreds = validatePublicApiUrl('https://user:pass@api.deepscakeshop.in', 'production');
+        assert.equal(prodCreds.valid, false);
+        assert.ok(prodCreds.error?.includes('credentials'));
+
+        // Production mode rejects single-word hosts without TLD
+        const prodNoTld = validatePublicApiUrl('https://internalserver', 'production');
+        assert.equal(prodNoTld.valid, false);
+        assert.ok(prodNoTld.error?.includes('valid domain name'));
+
+        // Valid production URL
+        const prodHttps = validatePublicApiUrl('https://api.deepscakeshop.in', 'production');
+        assert.equal(prodHttps.valid, true);
+
+        // Malformed URL
+        const malformed = validatePublicApiUrl('not-a-url', 'development');
+        assert.equal(malformed.valid, false);
+        assert.ok(malformed.error?.includes('valid URL'));
+
+        // Unsupported protocol
+        const ftpUrl = validatePublicApiUrl('ftp://api.deepscakeshop.in', 'development');
+        assert.equal(ftpUrl.valid, false);
+        assert.ok(ftpUrl.error?.includes('http:// or https://'));
+      });
+
+      it('validateNotificationConfig automatically enforces valid HTTPS PUBLIC_API_URL for live providers in production', async () => {
+        const { validateNotificationConfig } = await import('../src/config/env.js');
+
+        // Missing PUBLIC_API_URL when live SendGrid provider configured in production
+        const prodSendGridNoUrl = {
+          NOTIFICATION_MODE: 'production',
+          NOTIFICATION_EMAIL_PROVIDER: 'sendgrid',
+          NOTIFICATION_MESSAGING_PROVIDER: 'mock',
+          SENDGRID_API_KEY: 'SG.some_key_12345678901234567890',
+          PUBLIC_API_URL: '',
+        };
+        const check1 = validateNotificationConfig(prodSendGridNoUrl);
+        assert.equal(check1.valid, false);
+        assert.ok(check1.errors.some((e: string) => e.includes('PUBLIC_API_URL is required in production mode')));
+
+        // Inappropriate non-HTTPS PUBLIC_API_URL for live provider in production
+        const prodSendGridHttpUrl = {
+          NOTIFICATION_MODE: 'production',
+          NOTIFICATION_EMAIL_PROVIDER: 'sendgrid',
+          NOTIFICATION_MESSAGING_PROVIDER: 'mock',
+          SENDGRID_API_KEY: 'SG.some_key_12345678901234567890',
+          PUBLIC_API_URL: 'http://api.deepscakeshop.in',
+        };
+        const check2 = validateNotificationConfig(prodSendGridHttpUrl);
+        assert.equal(check2.valid, false);
+        assert.ok(check2.errors.some((e: string) => e.includes('https:// in production mode')));
+
+        // Inappropriate loopback PUBLIC_API_URL for live provider in production
+        const prodSendGridLocalhost = {
+          NOTIFICATION_MODE: 'production',
+          NOTIFICATION_EMAIL_PROVIDER: 'sendgrid',
+          NOTIFICATION_MESSAGING_PROVIDER: 'mock',
+          SENDGRID_API_KEY: 'SG.some_key_12345678901234567890',
+          PUBLIC_API_URL: 'https://localhost:5000',
+        };
+        const check3 = validateNotificationConfig(prodSendGridLocalhost);
+        assert.equal(check3.valid, false);
+        assert.ok(check3.errors.some((e: string) => e.includes('localhost or loopback address')));
+
+        // Valid HTTPS production configuration with live provider
+        const prodSendGridValid = {
+          NOTIFICATION_MODE: 'production',
+          NOTIFICATION_EMAIL_PROVIDER: 'sendgrid',
+          NOTIFICATION_MESSAGING_PROVIDER: 'mock',
+          SENDGRID_API_KEY: 'SG.some_key_12345678901234567890',
+          PUBLIC_API_URL: 'https://api.deepscakeshop.in',
+        };
+        const check4 = validateNotificationConfig(prodSendGridValid);
+        assert.equal(check4.valid, true);
+        assert.equal(check4.errors.length, 0);
+
+        // Safe mock mode default does not require PUBLIC_API_URL
+        const mockConfig = {
+          NOTIFICATION_MODE: 'mock',
+          NOTIFICATION_EMAIL_PROVIDER: 'mock',
+          NOTIFICATION_MESSAGING_PROVIDER: 'mock',
+        };
+        const check5 = validateNotificationConfig(mockConfig);
+        assert.equal(check5.valid, true);
+        assert.equal(check5.errors.length, 0);
+      });
+
+      it('reconstructTrustedTwilioUrl prevents path duplication if base URL already includes webhook path', async () => {
+        const { reconstructTrustedTwilioUrl } = await import('../src/services/webhookVerification.js');
+        const mockReq: any = {
+          originalUrl: '/api/webhooks/twilio',
+          url: '/api/webhooks/twilio',
+        };
+        const urlWithDup = reconstructTrustedTwilioUrl(mockReq, 'https://api.deepscakeshop.in/api/webhooks/twilio');
+        assert.equal(urlWithDup, 'https://api.deepscakeshop.in/api/webhooks/twilio');
+
+        const urlClean = reconstructTrustedTwilioUrl(mockReq, 'https://api.deepscakeshop.in');
+        assert.equal(urlClean, 'https://api.deepscakeshop.in/api/webhooks/twilio');
+      });
+
+      it('validateNotificationConfig validates safe options and flags missing required keys in production', async () => {
+        const { validateNotificationConfig } = await import('../src/config/env.js');
+
+        // Valid production config with all credentials
+        const validProdConfig = {
+          NOTIFICATION_MODE: 'production',
+          NOTIFICATION_EMAIL_PROVIDER: 'sendgrid',
+          NOTIFICATION_MESSAGING_PROVIDER: 'twilio',
+          SENDGRID_API_KEY: 'SG.some_api_key_for_testing_12345',
+          TWILIO_ACCOUNT_SID: 'mock_synthetic_twilio_account_sid_for_tests',
+          TWILIO_AUTH_TOKEN: 'auth_token_12345678901234567890',
+          SENDGRID_WEBHOOK_VERIFICATION_KEY: 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE123456789012345678901234567890==',
+          TWILIO_WHATSAPP_NUMBER: 'whatsapp:+14155238886',
+          PUBLIC_API_URL: 'https://api.deepscakeshop.in',
+        };
+        const validCheck = validateNotificationConfig(validProdConfig, {
+          requireSendgridWebhookKey: true,
+          requireTwilioWhatsApp: true,
+          requirePublicApiUrl: true,
+        });
+        assert.equal(validCheck.valid, true);
+        assert.equal(validCheck.errors.length, 0);
+
+        // Missing required settings when explicitly enabled
+        const incompleteConfig = {
+          NOTIFICATION_MODE: 'production',
+          NOTIFICATION_EMAIL_PROVIDER: 'sendgrid',
+          NOTIFICATION_MESSAGING_PROVIDER: 'twilio',
+          SENDGRID_API_KEY: 'SG.some_api_key_for_testing_12345',
+          TWILIO_ACCOUNT_SID: 'mock_synthetic_twilio_account_sid_for_tests',
+          TWILIO_AUTH_TOKEN: 'auth_token_12345678901234567890',
+          SENDGRID_WEBHOOK_VERIFICATION_KEY: '',
+          TWILIO_WHATSAPP_NUMBER: '',
+          PUBLIC_API_URL: '',
+        };
+        const missingCheck = validateNotificationConfig(incompleteConfig, {
+          requireSendgridWebhookKey: true,
+          requireTwilioWhatsApp: true,
+          requirePublicApiUrl: true,
+        });
+        assert.equal(missingCheck.valid, false);
+        assert.ok(missingCheck.errors.some((e: string) => e.includes('SENDGRID_WEBHOOK_VERIFICATION_KEY is required')));
+        assert.ok(missingCheck.errors.some((e: string) => e.includes('TWILIO_WHATSAPP_NUMBER is required')));
+        assert.ok(missingCheck.errors.some((e: string) => e.includes('PUBLIC_API_URL is required')));
+      });
+
+      // 3. Logger Redaction
+      it('logger redaction protects webhook verification keys, raw body, and WhatsApp numbers', async () => {
+        const { redactLogData } = await import('../src/utils/logger.js');
+        const { sanitizeLogDetails } = await import('../src/notifications/sanitize.js');
+
+        const payload = {
+          sendgrid_webhook_verification_key: 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEsecret',
+          webhook_verification_key: 'secret-webhook-key',
+          rawBody: Buffer.from('{"sensitive":"payload"}'),
+          raw_body: '{"sensitive":"payload"}',
+          rawPayload: '{"sensitive":"payload"}',
+          twilio_whatsapp_number: 'whatsapp:+919876543210',
+          whatsapp_number: '+14155238886',
+        };
+
+        const redacted = redactLogData(payload);
+        assert.equal(redacted.sendgrid_webhook_verification_key, '[REDACTED]');
+        assert.equal(redacted.webhook_verification_key, '[REDACTED]');
+        assert.equal(redacted.rawBody, '[REDACTED]');
+        assert.equal(redacted.raw_body, '[REDACTED]');
+        assert.equal(redacted.rawPayload, '[REDACTED]');
+        assert.ok(redacted.twilio_whatsapp_number.includes('******3210'));
+        assert.ok(redacted.whatsapp_number.includes('******8886'));
+
+        const sanitizedString = sanitizeLogDetails(
+          'Error verifying webhook: verification_key="MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEsecret" failed'
+        );
+        assert.ok(!sanitizedString.includes('MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEsecret'));
+        assert.ok(sanitizedString.includes('[REDACTED]'));
+      });
+
+      // 4. Raw-Body Capture - Exact Bytes, Spacing, and Unicode Preservation
+      it('webhookBodyParser preserves exact raw JSON request bytes including irregular spacing and newlines', async () => {
+        const express = (await import('express')).default;
+        const { webhookBodyParser } = await import('../src/middlewares/webhookBodyParser.js');
+
+        const testApp = express();
+        testApp.use('/api/webhooks', webhookBodyParser);
+        testApp.post('/api/webhooks/test-raw-bytes', (req, res) => {
+          res.json({
+            isBuffer: Buffer.isBuffer(req.rawBody),
+            rawBodyText: req.rawBody ? req.rawBody.toString('utf8') : null,
+            rawBodyHex: req.rawBody ? req.rawBody.toString('hex') : null,
+            parsedBody: req.body,
+          });
+        });
+
+        // Exact string with intentional spacing, indentation, trailing newline, and Unicode Hindi text
+        const exactRawPayload = '{\n  "event":   "delivered",\n  "custom_message": "बधाई हो जन्मदिन की!",\n  "count": 42\n}\n';
+
+        const res = await request(testApp)
+          .post('/api/webhooks/test-raw-bytes')
+          .set('Content-Type', 'application/json; charset=utf-8')
+          .send(exactRawPayload);
+
+        assert.equal(res.status, 200);
+        assert.equal(res.body.isBuffer, true);
+        assert.equal(res.body.rawBodyText, exactRawPayload, 'Raw body must match incoming string byte-for-byte');
+        assert.equal(res.body.rawBodyHex, Buffer.from(exactRawPayload, 'utf8').toString('hex'));
+        assert.equal(res.body.parsedBody.event, 'delivered');
+        assert.equal(res.body.parsedBody.custom_message, 'बधाई हो जन्मदिन की!');
+        assert.equal(res.body.parsedBody.count, 42);
+      });
+
+      // 5. URL-Encoded Webhook Raw-Body Capture (Twilio status callbacks)
+      it('webhookBodyParser preserves exact raw URL-encoded bytes and parses form body', async () => {
+        const express = (await import('express')).default;
+        const { webhookBodyParser } = await import('../src/middlewares/webhookBodyParser.js');
+
+        const testApp = express();
+        testApp.use('/api/webhooks', webhookBodyParser);
+        testApp.post('/api/webhooks/test-urlencoded', (req, res) => {
+          res.json({
+            isBuffer: Buffer.isBuffer(req.rawBody),
+            rawBodyText: req.rawBody ? req.rawBody.toString('utf8') : null,
+            parsedBody: req.body,
+          });
+        });
+
+        const rawFormString = 'MessageSid=SM1234567890abcdef&MessageStatus=delivered&To=whatsapp%3A%2B919876543210';
+
+        const res = await request(testApp)
+          .post('/api/webhooks/test-urlencoded')
+          .set('Content-Type', 'application/x-www-form-urlencoded')
+          .send(rawFormString);
+
+        assert.equal(res.status, 200);
+        assert.equal(res.body.isBuffer, true);
+        assert.equal(res.body.rawBodyText, rawFormString);
+        assert.equal(res.body.parsedBody.MessageSid, 'SM1234567890abcdef');
+        assert.equal(res.body.parsedBody.MessageStatus, 'delivered');
+        assert.equal(res.body.parsedBody.To, 'whatsapp:+919876543210');
+      });
+
+      // 6. Unsupported Media Type (HTTP 415)
+      it('webhookBodyParser rejects unsupported content types with HTTP 415', async () => {
+        const { app } = await import('../src/app.js');
+
+        // text/plain
+        const resText = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'text/plain')
+          .send('plaintext body');
+
+        assert.equal(resText.status, 415);
+        assert.equal(resText.body.success, false);
+        assert.ok(resText.body.message.includes('Unsupported Media Type'));
+
+        // application/xml
+        const resXml = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'application/xml')
+          .send('<event>delivered</event>');
+
+        assert.equal(resXml.status, 415);
+        assert.equal(resXml.body.success, false);
+
+        // application/octet-stream
+        const resOctet = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'application/octet-stream')
+          .send(Buffer.from('binary-data'));
+
+        assert.equal(resOctet.status, 415);
+        assert.equal(resOctet.body.success, false);
+      });
+
+      // 7. Oversized Payload Handling (HTTP 413)
+      it('webhookBodyParser rejects payloads exceeding 1MB with HTTP 413', async () => {
+        const { app } = await import('../src/app.js');
+
+        // Generate 1.2MB JSON payload
+        const largeData = 'A'.repeat(1.2 * 1024 * 1024);
+        const oversizedPayload = JSON.stringify({ data: largeData });
+
+        const res = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'application/json')
+          .send(oversizedPayload);
+
+        assert.equal(res.status, 413);
+        assert.equal(res.body.success, false);
+        assert.ok(res.body.message.includes('Payload Too Large'));
+      });
+
+      // 8. Malformed JSON Handling (HTTP 400)
+      it('webhookBodyParser handles malformed JSON with HTTP 400', async () => {
+        const { app } = await import('../src/app.js');
+
+        const res = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'application/json')
+          .send('{"event": "delivered", invalid_json');
+
+        assert.equal(res.status, 400);
+        assert.equal(res.body.success, false);
+        assert.ok(res.body.message.includes('Malformed JSON payload'));
+      });
+
+      // 9. Existing Route Compatibility & Scoped Raw Body Guarantee
+      it('preserves full compatibility with existing endpoints and does not buffer raw body on standard routes', async () => {
+        const { app } = await import('../src/app.js');
+
+        // Existing GET /api/cakes works
+        const resCakes = await request(app).get('/api/cakes');
+        assert.equal(resCakes.status, 200);
+        assert.equal(resCakes.body.success, true);
+        assert.ok(Array.isArray(resCakes.body.data));
+
+        // Existing POST /api/custom-cakes with JSON works as before
+        const validInquiry = {
+          customerName: 'Ananya Sharma',
+          phone: '9876543210',
+          email: 'ananya@example.com',
+          occasion: 'Birthday Celebration',
+          flavor: 'Belgian Dark Chocolate Truffle (70%)',
+          weight: '1 kg',
+          tierCount: '1 Tier',
+          isEggless: true,
+          messageOnCake: 'Happy 21st Ananya!',
+          preferredDate: '2026-12-25',
+          deliveryTimeSlot: '3:00 PM – 6:00 PM',
+          specialInstructions: 'Please add gold sprinkles on top.',
+        };
+
+        const resInquiry = await request(app)
+          .post('/api/custom-cakes')
+          .set('Content-Type', 'application/json')
+          .send(validInquiry);
+
+        assert.equal(resInquiry.status, 201);
+        assert.equal(resInquiry.body.success, true);
+        assert.ok(resInquiry.body.inquiryId.startsWith('INQ-'));
+
+        // Verify that standard application routes are NOT decorated with rawBody
+        const express = (await import('express')).default;
+        const testCompatApp = express();
+        const { webhookBodyParser } = await import('../src/middlewares/webhookBodyParser.js');
+        testCompatApp.use('/api/webhooks', webhookBodyParser);
+        testCompatApp.use(express.json({ limit: '10mb' }));
+
+        let capturedStandardRawBody: any = 'untested';
+        testCompatApp.post('/api/orders/standard-test', (req, res) => {
+          capturedStandardRawBody = (req as any).rawBody;
+          res.json({ success: true, body: req.body });
+        });
+
+        const resCompat = await request(testCompatApp)
+          .post('/api/orders/standard-test')
+          .send({ orderId: 'ord_123', amount: 500 });
+
+        assert.equal(resCompat.status, 200);
+        assert.equal(resCompat.body.success, true);
+        assert.equal(capturedStandardRawBody, undefined, 'Standard API routes must not store rawBody in memory');
+      });
+    });
+
+    // =========================================================================
+    // 19. NotificationLog Schema, Indexing, and Durable Webhook Deduplication
+    // (Phase 5, Milestone 2, Work Item 2)
+    // =========================================================================
+    describe('19. NotificationLog Schema, Indexing, and Durable Webhook Deduplication (Phase 5, Milestone 2, Work Item 2)', () => {
+      // 1. Existing records without providerMessageId remain valid
+      it('NotificationLog schema supports records without providerMessageId (backward compatibility)', async () => {
+        const { NotificationLogModel } = await import('../src/models/NotificationLog.js');
+
+        const legacyDoc = new NotificationLogModel({
+          notificationId: `NOTIF-LEGACY-${Date.now()}`,
+          idempotencyKey: `legacy-order-${Date.now()}`,
+          channel: 'email',
+          eventType: 'order_placed',
+          recipient: 'legacy.customer@example.com',
+          provider: 'mock',
+          deliveryStatus: 'delivered',
+        });
+
+        // Validation must pass without providerMessageId
+        const validateErr = legacyDoc.validateSync();
+        assert.equal(validateErr, undefined, 'Legacy document without providerMessageId must be valid');
+        assert.equal(legacyDoc.providerMessageId, undefined);
+      });
+
+      // 2. Persistence and lookup of top-level providerMessageId
+      it('persists and looks up top-level providerMessageId on NotificationLog', async () => {
+        const { notificationService } = await import('../src/notifications/notificationService.js');
+
+        const testProviderMsgId = `sg_msg_test_${Date.now()}_abc123`;
+        const testIdempotencyKey = `idemp-top-msg-${Date.now()}`;
+
+        await notificationService.saveNotificationLog({
+          notificationId: `NOTIF-TOP-${Date.now()}`,
+          idempotencyKey: testIdempotencyKey,
+          channel: 'email',
+          eventType: 'order_placed',
+          recipient: 'top.level@example.com',
+          provider: 'sendgrid',
+          providerMessageId: testProviderMsgId,
+          deliveryStatus: 'delivered',
+          metadata: { providerMessageId: testProviderMsgId },
+        });
+
+        const retrieved = await notificationService.getLogByProviderMessageId(testProviderMsgId);
+        assert.ok(retrieved, 'Must find notification log by top-level providerMessageId');
+        assert.equal(retrieved.providerMessageId, testProviderMsgId);
+        assert.equal(retrieved.idempotencyKey, testIdempotencyKey);
+      });
+
+      // 3. Fallback compatibility with metadata.providerMessageId
+      it('getLogByProviderMessageId falls back to legacy metadata.providerMessageId', async () => {
+        const { notificationService } = await import('../src/notifications/notificationService.js');
+
+        const legacyMetaMsgId = `twilio_meta_legacy_${Date.now()}`;
+        const legacyIdempotencyKey = `idemp-meta-${Date.now()}`;
+
+        // Save record with providerMessageId ONLY in metadata (legacy structure)
+        await notificationService.saveNotificationLog({
+          notificationId: `NOTIF-LEGACY-META-${Date.now()}`,
+          idempotencyKey: legacyIdempotencyKey,
+          channel: 'whatsapp',
+          eventType: 'order_status_updated',
+          recipient: '+919876543210',
+          provider: 'twilio',
+          deliveryStatus: 'delivered',
+          metadata: { providerMessageId: legacyMetaMsgId },
+        });
+
+        const retrieved = await notificationService.getLogByProviderMessageId(legacyMetaMsgId);
+        assert.ok(retrieved, 'Must find record using legacy metadata.providerMessageId fallback');
+        assert.equal(retrieved.metadata?.providerMessageId, legacyMetaMsgId);
+        assert.equal(retrieved.idempotencyKey, legacyIdempotencyKey);
+      });
+
+      // 4. Sparse-index definition and metadata inspection for NotificationLog
+      it('REQUIRED_NOTIFICATION_LOG_INDEXES declares providerMessageId_1 with sparse: true', async () => {
+        const { REQUIRED_NOTIFICATION_LOG_INDEXES, getNotificationLogIndexMetadata } = await import(
+          '../src/models/NotificationLog.js'
+        );
+
+        const providerMsgIdx = REQUIRED_NOTIFICATION_LOG_INDEXES.find((i) => i.name === 'providerMessageId_1');
+        assert.ok(providerMsgIdx, 'Must declare providerMessageId_1 index');
+        assert.equal(providerMsgIdx.sparse, true, 'providerMessageId index must be sparse');
+        assert.equal(providerMsgIdx.background, true);
+        assert.deepEqual(providerMsgIdx.key, { providerMessageId: 1 });
+
+        const metadata = await getNotificationLogIndexMetadata();
+        assert.ok(typeof metadata.connected === 'boolean');
+        assert.ok(Array.isArray(metadata.missingIndexes));
+        assert.ok(Array.isArray(metadata.mismatchedIndexes));
+      });
+
+      // 5. WebhookEvent index specifications
+      it('REQUIRED_WEBHOOK_EVENT_INDEXES declares compound unique index and sparse message ID index', async () => {
+        const { REQUIRED_WEBHOOK_EVENT_INDEXES, getWebhookEventIndexMetadata } = await import(
+          '../src/models/notificationLogIndexManager.js'
+        );
+
+        const compoundIdx = REQUIRED_WEBHOOK_EVENT_INDEXES.find((i) => i.name === 'provider_1_eventId_1');
+        assert.ok(compoundIdx, 'Must declare provider_1_eventId_1 index');
+        assert.equal(compoundIdx.unique, true, 'provider_1_eventId_1 must be a unique compound index');
+        assert.deepEqual(compoundIdx.key, { provider: 1, eventId: 1 });
+
+        const msgIdx = REQUIRED_WEBHOOK_EVENT_INDEXES.find((i) => i.name === 'providerMessageId_1');
+        assert.ok(msgIdx, 'Must declare providerMessageId_1 index on WebhookEvent');
+        assert.equal(msgIdx.sparse, true, 'providerMessageId_1 on WebhookEvent must be sparse');
+
+        const metadata = await getWebhookEventIndexMetadata();
+        assert.ok(typeof metadata.connected === 'boolean');
+        assert.ok(Array.isArray(metadata.missingIndexes));
+      });
+
+      // 6. Safe, repeatable index initialization in dryRun mode
+      it('ensureWebhookEventIndexes and ensureAllNotificationIndexes run safely in dryRun mode', async () => {
+        const { ensureWebhookEventIndexes, ensureAllNotificationIndexes } = await import(
+          '../src/models/notificationLogIndexManager.js'
+        );
+
+        const whResult = await ensureWebhookEventIndexes({ dryRun: true });
+        assert.equal(whResult.dryRun, true);
+        assert.equal(whResult.applied, false);
+        assert.ok(Array.isArray(whResult.createdIndexes));
+        assert.ok(Array.isArray(whResult.alreadyPresent));
+
+        const allResult = await ensureAllNotificationIndexes({ dryRun: true });
+        assert.equal(allResult.notificationLogs.dryRun, true);
+        assert.equal(allResult.webhookEvents.dryRun, true);
+      });
+
+      // 7. Webhook-event reservation and duplicate rejection
+      it('reserveWebhookEvent successfully reserves an event and rejects duplicates for same provider and eventId', async () => {
+        const { reserveWebhookEvent } = await import('../src/models/WebhookEvent.js');
+
+        const uniqueEventId = `sg_evt_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
+        // First attempt: should successfully reserve
+        const res1 = await reserveWebhookEvent({
+          provider: 'sendgrid',
+          eventId: uniqueEventId,
+          providerMessageId: 'sg_msg_123',
+          eventType: 'delivered',
+          sanitizedSummary: { reason: 'Delivered to recipient mail server' },
+        });
+
+        assert.equal(res1.reserved, true);
+        assert.equal(res1.isDuplicate, false);
+        assert.ok(res1.event);
+
+        // Second attempt with exact same provider and eventId: must be detected as duplicate
+        const res2 = await reserveWebhookEvent({
+          provider: 'sendgrid',
+          eventId: uniqueEventId,
+          providerMessageId: 'sg_msg_123',
+          eventType: 'delivered',
+        });
+
+        assert.equal(res2.reserved, false);
+        assert.equal(res2.isDuplicate, true);
+        assert.ok(res2.event);
+      });
+
+      // 8. Cross-provider event ID isolation
+      it('reserveWebhookEvent accepts identical eventId from different providers', async () => {
+        const { reserveWebhookEvent } = await import('../src/models/WebhookEvent.js');
+
+        const sharedEventId = `evt_shared_${Date.now()}`;
+
+        // Reserve for sendgrid
+        const sgRes = await reserveWebhookEvent({
+          provider: 'sendgrid',
+          eventId: sharedEventId,
+          providerMessageId: 'sg_msg_456',
+          eventType: 'delivered',
+        });
+        assert.equal(sgRes.reserved, true);
+        assert.equal(sgRes.isDuplicate, false);
+
+        // Reserve same eventId for twilio: must NOT collide with sendgrid
+        const twilioRes = await reserveWebhookEvent({
+          provider: 'twilio',
+          eventId: sharedEventId,
+          providerMessageId: 'SM123456789',
+          eventType: 'delivered',
+        });
+        assert.equal(twilioRes.reserved, true, 'Different provider with same eventId must succeed');
+        assert.equal(twilioRes.isDuplicate, false);
+      });
+
+      // 9. Concurrent duplicate reservation attempts
+      it('reserveWebhookEvent handles concurrent reservation attempts safely', async () => {
+        const { reserveWebhookEvent } = await import('../src/models/WebhookEvent.js');
+
+        const raceEventId = `race_evt_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+
+        // Fire 5 simultaneous reservations for the exact same event
+        const attempts = await Promise.all([
+          reserveWebhookEvent({ provider: 'sendgrid', eventId: raceEventId }),
+          reserveWebhookEvent({ provider: 'sendgrid', eventId: raceEventId }),
+          reserveWebhookEvent({ provider: 'sendgrid', eventId: raceEventId }),
+          reserveWebhookEvent({ provider: 'sendgrid', eventId: raceEventId }),
+          reserveWebhookEvent({ provider: 'sendgrid', eventId: raceEventId }),
+        ]);
+
+        const reservedCount = attempts.filter((a) => a.reserved === true).length;
+        const duplicateCount = attempts.filter((a) => a.isDuplicate === true).length;
+
+        assert.equal(reservedCount, 1, 'Exactly one concurrent attempt must reserve the event');
+        assert.equal(duplicateCount, 4, 'Remaining 4 attempts must be flagged as duplicates');
+      });
+
+      // 10. Missing or invalid event identifiers
+      it('reserveWebhookEvent rejects missing or invalid provider and eventId', async () => {
+        const { reserveWebhookEvent } = await import('../src/models/WebhookEvent.js');
+
+        // Missing provider
+        const noProvider = await reserveWebhookEvent({ provider: '', eventId: 'evt_123' });
+        assert.equal(noProvider.reserved, false);
+        assert.ok(noProvider.error?.includes('"provider" is required'));
+
+        // Missing eventId
+        const noEventId = await reserveWebhookEvent({ provider: 'sendgrid', eventId: '   ' });
+        assert.equal(noEventId.reserved, false);
+        assert.ok(noEventId.error?.includes('"eventId" is required'));
+      });
+
+      // 11. Event summary sanitization excludes raw payloads, secrets, and PII
+      it('sanitizeWebhookEventSummary strictly strips secrets, signatures, raw bodies, and PII', async () => {
+        const { sanitizeWebhookEventSummary } = await import('../src/models/WebhookEvent.js');
+
+        const rawSummary = {
+          eventType: 'delivered',
+          status: 'success',
+          reason: 'Accepted by remote host',
+          statusCode: 250,
+          apiKey: 'SG.secret_key_123',
+          secret: 'webhook_secret_xyz',
+          signature: 'v1=sig_abc123',
+          rawBody: '{"full":"body"}',
+          customerEmail: 'customer@deepscakeshop.in',
+          customerPhone: '+919876543210',
+          contact: '9876543210',
+        };
+
+        const clean = sanitizeWebhookEventSummary(rawSummary);
+        assert.ok(clean);
+        assert.equal(clean.eventType, 'delivered');
+        assert.equal(clean.status, 'success');
+        assert.equal(clean.statusCode, 250);
+        assert.equal(clean.apiKey, undefined, 'Must strip apiKey');
+        assert.equal(clean.secret, undefined, 'Must strip secret');
+        assert.equal(clean.signature, undefined, 'Must strip signature');
+        assert.equal(clean.rawBody, undefined, 'Must strip rawBody');
+        assert.equal(clean.customerEmail, undefined, 'Must strip customerEmail');
+        assert.equal(clean.customerPhone, undefined, 'Must strip customerPhone');
+        assert.equal(clean.contact, undefined, 'Must strip contact');
+      });
+
+      // 12. Mock mode preserved; dispatch and retry operations function with providerMessageId
+      it('dispatch notification preserves mock mode and returns providerMessageId from mock provider', async () => {
+        const { notificationService } = await import('../src/notifications/notificationService.js');
+
+        const dispatchResult = await notificationService.dispatch({
+          channel: 'email',
+          eventType: 'order_placed',
+          recipient: 'test.order.mock@example.com',
+          subject: 'Order Placed Test',
+          message: 'Thank you for ordering with Deep’s Cake Shop!',
+          idempotencyKey: `mock-dispatch-check-${Date.now()}`,
+          customerConsent: { email: true },
+        });
+
+        assert.equal(dispatchResult.status, 'delivered');
+        assert.ok(dispatchResult.providerMessageId?.startsWith('mock_msg_'));
+
+        // Query by the returned provider message ID
+        const found = await notificationService.getLogByProviderMessageId(dispatchResult.providerMessageId!);
+        assert.ok(found, 'Log must be retrievable via getLogByProviderMessageId');
+        assert.equal(found.providerMessageId, dispatchResult.providerMessageId);
+      });
+    });
+
+    // =========================================================================
+    // 20. Secure Webhook Signature Verification and Route Dispatch
+    // (Phase 5, Milestone 2, Work Item 3)
+    // =========================================================================
+    describe('20. Secure Webhook Signature Verification and Route Dispatch (Phase 5, Milestone 2, Work Item 3)', () => {
+      // Helper to generate dynamic SendGrid ECDSA P-256 test keypair
+      async function getCrypto() {
+        return (await import('crypto')).default;
+      }
+
+      async function generateSendgridTestKeyPair() {
+        const crypto = await getCrypto();
+        const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', {
+          namedCurve: 'prime256v1',
+        });
+        const spkiDer = publicKey.export({ format: 'der', type: 'spki' });
+        const base64Key = spkiDer.toString('base64');
+        return { publicKey, privateKey, base64Key };
+      }
+
+      async function signSendgridPayload(privateKey: any, timestamp: string, rawBody: string | Buffer): Promise<string> {
+        const crypto = await getCrypto();
+        const timestampBuf = Buffer.from(timestamp, 'utf8');
+        const bodyBuf = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(rawBody, 'utf8');
+        const payload = Buffer.concat([timestampBuf, bodyBuf]);
+        return crypto.sign('sha256', payload, privateKey).toString('base64');
+      }
+
+      async function signTwilioPayload(authToken: string, url: string, params: Record<string, any>): Promise<string> {
+        const crypto = await getCrypto();
+        let data = url;
+        const sortedKeys = Object.keys(params).sort();
+        for (const k of sortedKeys) {
+          const val = params[k];
+          data += `${k}${val !== undefined && val !== null ? String(val) : ''}`;
+        }
+        return crypto.createHmac('sha1', authToken).update(Buffer.from(data, 'utf8')).digest('base64');
+      }
+
+      // 1. Valid and invalid SendGrid signatures
+      it('verifies valid SendGrid ECDSA signatures and rejects invalid/tampered signatures', async () => {
+        const { notificationService } = await import('../src/notifications/notificationService.js');
+        const { NotificationLogModel, MEMORY_NOTIFICATION_LOGS } = await import('../src/models/NotificationLog.js');
+        const { isDbConnected } = await import('../src/config/db.js');
+
+        const { privateKey, base64Key } = await generateSendgridTestKeyPair();
+        process.env.SENDGRID_WEBHOOK_VERIFICATION_KEY = base64Key;
+
+        const testMsgId = `sg_msg_valid_${Date.now()}`;
+        if (isDbConnected()) {
+          await NotificationLogModel.create({
+            notificationId: `NOTIF-SG-${Date.now()}`,
+            idempotencyKey: `idemp-sg-${Date.now()}`,
+            channel: 'email',
+            eventType: 'order_placed',
+            recipient: 'customer.valid@example.com',
+            provider: 'sendgrid',
+            providerMessageId: testMsgId,
+            deliveryStatus: 'sending',
+          });
+        } else {
+          MEMORY_NOTIFICATION_LOGS.push({
+            notificationId: `NOTIF-SG-${Date.now()}`,
+            idempotencyKey: `idemp-sg-${Date.now()}`,
+            channel: 'email',
+            eventType: 'order_placed',
+            recipient: 'customer.valid@example.com',
+            provider: 'sendgrid',
+            providerMessageId: testMsgId,
+            deliveryStatus: 'sending',
+          });
+        }
+
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const events = [
+          {
+            sg_event_id: `evt_sg_valid_${Date.now()}`,
+            event: 'delivered',
+            sg_message_id: testMsgId,
+            timestamp: Number(timestamp),
+            email: 'customer.valid@example.com',
+          },
+        ];
+        const rawJson = JSON.stringify(events);
+        const validSig = await signSendgridPayload(privateKey, timestamp, rawJson);
+
+        // A. Valid signature passes
+        const resValid = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'application/json')
+          .set('X-Twilio-Email-Event-Webhook-Signature', validSig)
+          .set('X-Twilio-Email-Event-Webhook-Timestamp', timestamp)
+          .send(rawJson);
+
+        assert.equal(resValid.status, 200);
+        assert.equal(resValid.body.success, true);
+        assert.equal(resValid.body.processedCount, 1);
+
+        // Verify status updated to delivered
+        const updatedLog = await notificationService.getLogByProviderMessageId(testMsgId);
+        assert.equal(updatedLog.deliveryStatus, 'delivered');
+
+        // B. Invalid signature fails with 401
+        const resInvalid = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'application/json')
+          .set('X-Twilio-Email-Event-Webhook-Signature', 'bad_signature_base64==')
+          .set('X-Twilio-Email-Event-Webhook-Timestamp', timestamp)
+          .send(rawJson);
+
+        assert.equal(resInvalid.status, 401);
+        assert.equal(resInvalid.body.success, false);
+
+        // C. Tampered body fails with 401
+        const tamperedJson = JSON.stringify([{ ...events[0], email: 'attacker@evil.com' }]);
+        const resTampered = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'application/json')
+          .set('X-Twilio-Email-Event-Webhook-Signature', validSig)
+          .set('X-Twilio-Email-Event-Webhook-Timestamp', timestamp)
+          .send(tamperedJson);
+
+        assert.equal(resTampered.status, 401);
+        assert.equal(resTampered.body.success, false);
+      });
+
+      // 2. Valid and invalid Twilio signatures
+      it('verifies valid Twilio HMAC-SHA1 signatures and rejects invalid/tampered signatures', async () => {
+        const { notificationService } = await import('../src/notifications/notificationService.js');
+        const { NotificationLogModel, MEMORY_NOTIFICATION_LOGS } = await import('../src/models/NotificationLog.js');
+        const { reconstructTrustedTwilioUrl } = await import('../src/services/webhookVerification.js');
+        const { isDbConnected } = await import('../src/config/db.js');
+
+        const testAuthToken = 'twilio_auth_token_secret_12345';
+        process.env.TWILIO_AUTH_TOKEN = testAuthToken;
+
+        const testMsgId = `SM_valid_${Date.now()}`;
+        if (isDbConnected()) {
+          await NotificationLogModel.create({
+            notificationId: `NOTIF-TW-${Date.now()}`,
+            idempotencyKey: `idemp-tw-${Date.now()}`,
+            channel: 'whatsapp',
+            eventType: 'order_placed',
+            recipient: '+919876543210',
+            provider: 'twilio',
+            providerMessageId: testMsgId,
+            deliveryStatus: 'sending',
+          });
+        } else {
+          MEMORY_NOTIFICATION_LOGS.push({
+            notificationId: `NOTIF-TW-${Date.now()}`,
+            idempotencyKey: `idemp-tw-${Date.now()}`,
+            channel: 'whatsapp',
+            eventType: 'order_placed',
+            recipient: '+919876543210',
+            provider: 'twilio',
+            providerMessageId: testMsgId,
+            deliveryStatus: 'sending',
+          });
+        }
+
+        const trustedUrl = reconstructTrustedTwilioUrl({ originalUrl: '/api/webhooks/twilio' } as any);
+        const params = {
+          MessageSid: testMsgId,
+          MessageStatus: 'delivered',
+          To: '+919876543210',
+        };
+        const validSig = await signTwilioPayload(testAuthToken, trustedUrl, params);
+        const formBody = `MessageSid=${encodeURIComponent(testMsgId)}&MessageStatus=delivered&To=%2B919876543210`;
+
+        // A. Valid signature passes
+        const resValid = await request(app)
+          .post('/api/webhooks/twilio')
+          .set('Content-Type', 'application/x-www-form-urlencoded')
+          .set('X-Twilio-Signature', validSig)
+          .send(formBody);
+
+        assert.equal(resValid.status, 200);
+        assert.equal(resValid.body.success, true);
+        assert.equal(resValid.body.statusChanged, true);
+
+        const updatedLog = await notificationService.getLogByProviderMessageId(testMsgId);
+        assert.equal(updatedLog.deliveryStatus, 'delivered');
+
+        // B. Invalid signature fails with 401
+        const resInvalid = await request(app)
+          .post('/api/webhooks/twilio')
+          .set('Content-Type', 'application/x-www-form-urlencoded')
+          .set('X-Twilio-Signature', 'invalid_twilio_signature==')
+          .send(formBody);
+
+        assert.equal(resInvalid.status, 401);
+        assert.equal(resInvalid.body.success, false);
+
+        // C. Tampered parameter value fails with 401
+        const tamperedBody = `MessageSid=${encodeURIComponent(testMsgId)}&MessageStatus=failed&To=%2B919876543210`;
+        const resTampered = await request(app)
+          .post('/api/webhooks/twilio')
+          .set('Content-Type', 'application/x-www-form-urlencoded')
+          .set('X-Twilio-Signature', validSig)
+          .send(tamperedBody);
+
+        assert.equal(resTampered.status, 401);
+        assert.equal(resTampered.body.success, false);
+      });
+
+      // 3. Missing signatures, malformed payloads, and incorrect callback URLs
+      it('rejects missing signatures, malformed payloads, expired timestamps, and host-header injection attempts', async () => {
+        const { reconstructTrustedTwilioUrl } = await import('../src/services/webhookVerification.js');
+        const { privateKey, base64Key } = await generateSendgridTestKeyPair();
+        process.env.SENDGRID_WEBHOOK_VERIFICATION_KEY = base64Key;
+        process.env.TWILIO_AUTH_TOKEN = 'secret_token_abc';
+
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const validEvents = [{ sg_event_id: 'evt_1', event: 'processed', sg_message_id: 'msg_1' }];
+        const rawJson = JSON.stringify(validEvents);
+        const sig = await signSendgridPayload(privateKey, timestamp, rawJson);
+
+        // A. SendGrid missing signature header -> 401
+        const resNoSig = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'application/json')
+          .set('X-Twilio-Email-Event-Webhook-Timestamp', timestamp)
+          .send(rawJson);
+        assert.equal(resNoSig.status, 401);
+
+        // B. SendGrid missing timestamp header -> 401
+        const resNoTs = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'application/json')
+          .set('X-Twilio-Email-Event-Webhook-Signature', sig)
+          .send(rawJson);
+        assert.equal(resNoTs.status, 401);
+
+        // C. SendGrid expired timestamp (> 10 minutes old) -> 401
+        const expiredTimestamp = (Math.floor(Date.now() / 1000) - 700).toString();
+        const expiredSig = await signSendgridPayload(privateKey, expiredTimestamp, rawJson);
+        const resExpired = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'application/json')
+          .set('X-Twilio-Email-Event-Webhook-Signature', expiredSig)
+          .set('X-Twilio-Email-Event-Webhook-Timestamp', expiredTimestamp)
+          .send(rawJson);
+        assert.equal(resExpired.status, 401);
+
+        // D. SendGrid non-array payload -> 400
+        const nonArrayJson = JSON.stringify({ notAnArray: true });
+        const nonArraySig = await signSendgridPayload(privateKey, timestamp, nonArrayJson);
+        const resNonArray = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'application/json')
+          .set('X-Twilio-Email-Event-Webhook-Signature', nonArraySig)
+          .set('X-Twilio-Email-Event-Webhook-Timestamp', timestamp)
+          .send(nonArrayJson);
+        assert.equal(resNonArray.status, 400);
+
+        // E. Twilio missing signature header -> 401
+        const resTwilioNoSig = await request(app)
+          .post('/api/webhooks/twilio')
+          .set('Content-Type', 'application/x-www-form-urlencoded')
+          .send('MessageSid=SM123&MessageStatus=delivered');
+        assert.equal(resTwilioNoSig.status, 401);
+
+        // F. Twilio missing MessageSid -> 400
+        const trustedUrl = reconstructTrustedTwilioUrl({ originalUrl: '/api/webhooks/twilio' } as any);
+        const noSidParams = { MessageStatus: 'delivered' };
+        const noSidSig = await signTwilioPayload(process.env.TWILIO_AUTH_TOKEN, trustedUrl, noSidParams);
+        const resTwilioNoSid = await request(app)
+          .post('/api/webhooks/twilio')
+          .set('Content-Type', 'application/x-www-form-urlencoded')
+          .set('X-Twilio-Signature', noSidSig)
+          .send('MessageStatus=delivered');
+        assert.equal(resTwilioNoSid.status, 400);
+
+        // G. Twilio missing MessageStatus -> 400
+        const noStatusParams = { MessageSid: 'SM123' };
+        const noStatusSig = await signTwilioPayload(process.env.TWILIO_AUTH_TOKEN, trustedUrl, noStatusParams);
+        const resTwilioNoStatus = await request(app)
+          .post('/api/webhooks/twilio')
+          .set('Content-Type', 'application/x-www-form-urlencoded')
+          .set('X-Twilio-Signature', noStatusSig)
+          .send('MessageSid=SM123');
+        assert.equal(resTwilioNoStatus.status, 400);
+
+        // H. Host-header injection attack defense
+        // Attacker calculates signature using attacker.com and sends Host: attacker.com
+        const attackerUrl = 'https://attacker.com/api/webhooks/twilio';
+        const attackerParams = { MessageSid: 'SM999', MessageStatus: 'delivered' };
+        const attackerSig = await signTwilioPayload(process.env.TWILIO_AUTH_TOKEN, attackerUrl, attackerParams);
+        const resHostSpoof = await request(app)
+          .post('/api/webhooks/twilio')
+          .set('Host', 'attacker.com')
+          .set('X-Forwarded-Host', 'attacker.com')
+          .set('Content-Type', 'application/x-www-form-urlencoded')
+          .set('X-Twilio-Signature', attackerSig)
+          .send('MessageSid=SM999&MessageStatus=delivered');
+        assert.equal(resHostSpoof.status, 401, 'Host-header spoofing must fail verification');
+      });
+
+      // 4. Raw-body preservation and middleware ordering
+      it('preserves exact raw request bytes before JSON parsing and enforces 1MB limit / 415 media type', async () => {
+        const { privateKey, base64Key } = await generateSendgridTestKeyPair();
+        process.env.SENDGRID_WEBHOOK_VERIFICATION_KEY = base64Key;
+
+        // Raw body containing non-canonical spacing and characters
+        const irregularRawBody = '  [\n  {\n   "sg_event_id": "evt_raw_1",\n   "event": "processed",\n   "sg_message_id": "msg_raw_1"\n  }\n ]  ';
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const sig = await signSendgridPayload(privateKey, timestamp, irregularRawBody);
+
+        const resRaw = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'application/json')
+          .set('X-Twilio-Email-Event-Webhook-Signature', sig)
+          .set('X-Twilio-Email-Event-Webhook-Timestamp', timestamp)
+          .send(irregularRawBody);
+
+        assert.equal(resRaw.status, 200, 'Signature verification on un-normalized raw bytes must succeed');
+
+        // Payload > 1MB returns 413
+        const largeString = 'a'.repeat(1024 * 1024 + 50); // > 1MB
+        const resTooLarge = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'application/json')
+          .send(largeString);
+
+        assert.equal(resTooLarge.status, 413);
+
+        // Unsupported media type returns 415
+        const res415 = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'text/plain')
+          .send('some raw text');
+
+        assert.equal(res415.status, 415);
+      });
+
+      // 5. Duplicate event delivery and concurrent deduplication
+      it('enforces durable deduplication using reserveWebhookEvent without re-applying status changes', async () => {
+        const { NotificationLogModel, MEMORY_NOTIFICATION_LOGS } = await import('../src/models/NotificationLog.js');
+        const { reconstructTrustedTwilioUrl } = await import('../src/services/webhookVerification.js');
+        const { isDbConnected } = await import('../src/config/db.js');
+
+        const { privateKey, base64Key } = await generateSendgridTestKeyPair();
+        process.env.SENDGRID_WEBHOOK_VERIFICATION_KEY = base64Key;
+
+        const testMsgId = `sg_msg_dup_${Date.now()}`;
+        if (isDbConnected()) {
+          await NotificationLogModel.create({
+            notificationId: `NOTIF-DUP-${Date.now()}`,
+            idempotencyKey: `idemp-dup-${Date.now()}`,
+            channel: 'email',
+            eventType: 'order_placed',
+            recipient: 'dup@example.com',
+            provider: 'sendgrid',
+            providerMessageId: testMsgId,
+            deliveryStatus: 'pending',
+          });
+        } else {
+          MEMORY_NOTIFICATION_LOGS.push({
+            notificationId: `NOTIF-DUP-${Date.now()}`,
+            idempotencyKey: `idemp-dup-${Date.now()}`,
+            channel: 'email',
+            eventType: 'order_placed',
+            recipient: 'dup@example.com',
+            provider: 'sendgrid',
+            providerMessageId: testMsgId,
+            deliveryStatus: 'pending',
+          });
+        }
+
+        const sharedEventId = `evt_dedup_${Date.now()}`;
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const events = [
+          {
+            sg_event_id: sharedEventId,
+            event: 'delivered',
+            sg_message_id: testMsgId,
+            timestamp: Number(timestamp),
+          },
+        ];
+        const rawJson = JSON.stringify(events);
+        const sig = await signSendgridPayload(privateKey, timestamp, rawJson);
+
+        // Delivery 1
+        const res1 = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'application/json')
+          .set('X-Twilio-Email-Event-Webhook-Signature', sig)
+          .set('X-Twilio-Email-Event-Webhook-Timestamp', timestamp)
+          .send(rawJson);
+
+        assert.equal(res1.status, 200);
+        assert.equal(res1.body.processedCount, 1);
+        assert.equal(res1.body.duplicateCount, 0);
+
+        // Delivery 2 (Duplicate replay)
+        const res2 = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'application/json')
+          .set('X-Twilio-Email-Event-Webhook-Signature', sig)
+          .set('X-Twilio-Email-Event-Webhook-Timestamp', timestamp)
+          .send(rawJson);
+
+        assert.equal(res2.status, 200);
+        assert.equal(res2.body.processedCount, 0);
+        assert.equal(res2.body.duplicateCount, 1);
+
+        // Twilio deduplication test
+        const twilioAuthToken = 'twilio_token_dup_test';
+        process.env.TWILIO_AUTH_TOKEN = twilioAuthToken;
+        const twMsgId = `SM_dup_${Date.now()}`;
+        const trustedUrl = reconstructTrustedTwilioUrl({ originalUrl: '/api/webhooks/twilio' } as any);
+        const twParams = { MessageSid: twMsgId, MessageStatus: 'delivered' };
+        const twSig = await signTwilioPayload(twilioAuthToken, trustedUrl, twParams);
+        const twBody = `MessageSid=${encodeURIComponent(twMsgId)}&MessageStatus=delivered`;
+
+        // First callback
+        const twRes1 = await request(app)
+          .post('/api/webhooks/twilio')
+          .set('Content-Type', 'application/x-www-form-urlencoded')
+          .set('X-Twilio-Signature', twSig)
+          .send(twBody);
+        assert.equal(twRes1.status, 200);
+
+        // Second duplicate callback
+        const twRes2 = await request(app)
+          .post('/api/webhooks/twilio')
+          .set('Content-Type', 'application/x-www-form-urlencoded')
+          .set('X-Twilio-Signature', twSig)
+          .send(twBody);
+        assert.equal(twRes2.status, 200);
+        assert.ok(twRes2.body.message.includes('duplicate'));
+      });
+
+      // 6. Unknown provider message IDs and unsupported event types
+      it('safely handles unknown provider message IDs and unsupported event types without leaking errors', async () => {
+        const { reconstructTrustedTwilioUrl } = await import('../src/services/webhookVerification.js');
+        const { privateKey, base64Key } = await generateSendgridTestKeyPair();
+        process.env.SENDGRID_WEBHOOK_VERIFICATION_KEY = base64Key;
+        process.env.TWILIO_AUTH_TOKEN = 'token_unknown_tests';
+
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+
+        // A. SendGrid unknown message ID -> 200 OK without error leak
+        const eventsUnknownMsg = [
+          {
+            sg_event_id: `evt_unkn_msg_${Date.now()}`,
+            event: 'delivered',
+            sg_message_id: 'non_existent_msg_id_9999',
+            timestamp: Number(timestamp),
+          },
+        ];
+        const rawUnknown = JSON.stringify(eventsUnknownMsg);
+        const sigUnknown = await signSendgridPayload(privateKey, timestamp, rawUnknown);
+
+        const resUnkMsg = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'application/json')
+          .set('X-Twilio-Email-Event-Webhook-Signature', sigUnknown)
+          .set('X-Twilio-Email-Event-Webhook-Timestamp', timestamp)
+          .send(rawUnknown);
+
+        assert.equal(resUnkMsg.status, 200);
+
+        // B. SendGrid unsupported event type -> 200 OK, ignoredCount: 1
+        const eventsUnsupp = [
+          {
+            sg_event_id: `evt_unsupp_${Date.now()}`,
+            event: 'quantum_bounce',
+            sg_message_id: 'some_msg_id',
+            timestamp: Number(timestamp),
+          },
+        ];
+        const rawUnsupp = JSON.stringify(eventsUnsupp);
+        const sigUnsupp = await signSendgridPayload(privateKey, timestamp, rawUnsupp);
+
+        const resUnsupp = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'application/json')
+          .set('X-Twilio-Email-Event-Webhook-Signature', sigUnsupp)
+          .set('X-Twilio-Email-Event-Webhook-Timestamp', timestamp)
+          .send(rawUnsupp);
+
+        assert.equal(resUnsupp.status, 200);
+        assert.equal(resUnsupp.body.ignoredCount, 1);
+
+        // C. Twilio unknown message ID -> 200 OK
+        const trustedUrl = reconstructTrustedTwilioUrl({ originalUrl: '/api/webhooks/twilio' } as any);
+        const twParamsUnk = { MessageSid: 'SM_unknown_nonexistent', MessageStatus: 'delivered' };
+        const twSigUnk = await signTwilioPayload(process.env.TWILIO_AUTH_TOKEN, trustedUrl, twParamsUnk);
+        const twResUnk = await request(app)
+          .post('/api/webhooks/twilio')
+          .set('Content-Type', 'application/x-www-form-urlencoded')
+          .set('X-Twilio-Signature', twSigUnk)
+          .send('MessageSid=SM_unknown_nonexistent&MessageStatus=delivered');
+
+        assert.equal(twResUnk.status, 200);
+        assert.equal(twResUnk.body.statusChanged, false);
+      });
+
+      // 7. Out-of-order callbacks and terminal delivery-status protection
+      it('protects terminal delivered status against stale out-of-order callbacks and separates engagement events', async () => {
+        const { notificationService } = await import('../src/notifications/notificationService.js');
+        const { NotificationLogModel, MEMORY_NOTIFICATION_LOGS } = await import('../src/models/NotificationLog.js');
+        const { reconstructTrustedTwilioUrl } = await import('../src/services/webhookVerification.js');
+        const { isDbConnected } = await import('../src/config/db.js');
+
+        const { privateKey, base64Key } = await generateSendgridTestKeyPair();
+        process.env.SENDGRID_WEBHOOK_VERIFICATION_KEY = base64Key;
+        process.env.TWILIO_AUTH_TOKEN = 'token_protection_tests';
+
+        const sgMsgId = `sg_terminal_${Date.now()}`;
+        if (isDbConnected()) {
+          await NotificationLogModel.create({
+            notificationId: `NOTIF-TERM-SG-${Date.now()}`,
+            idempotencyKey: `idemp-term-sg-${Date.now()}`,
+            channel: 'email',
+            eventType: 'order_placed',
+            recipient: 'terminal.sg@example.com',
+            provider: 'sendgrid',
+            providerMessageId: sgMsgId,
+            deliveryStatus: 'delivered',
+            sentAt: new Date(Date.now() - 3600000),
+          });
+        } else {
+          MEMORY_NOTIFICATION_LOGS.push({
+            notificationId: `NOTIF-TERM-SG-${Date.now()}`,
+            idempotencyKey: `idemp-term-sg-${Date.now()}`,
+            channel: 'email',
+            eventType: 'order_placed',
+            recipient: 'terminal.sg@example.com',
+            provider: 'sendgrid',
+            providerMessageId: sgMsgId,
+            deliveryStatus: 'delivered',
+            sentAt: new Date(Date.now() - 3600000),
+          });
+        }
+
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+
+        // A. SendGrid out-of-order bounce arrives: MUST NOT downgrade delivered status
+        const bounceEvents = [
+          {
+            sg_event_id: `evt_bounce_${Date.now()}`,
+            event: 'bounce',
+            sg_message_id: sgMsgId,
+            reason: 'Delayed MX bounce response',
+            timestamp: Number(timestamp),
+          },
+        ];
+        const rawBounce = JSON.stringify(bounceEvents);
+        const sigBounce = await signSendgridPayload(privateKey, timestamp, rawBounce);
+
+        const resBounce = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'application/json')
+          .set('X-Twilio-Email-Event-Webhook-Signature', sigBounce)
+          .set('X-Twilio-Email-Event-Webhook-Timestamp', timestamp)
+          .send(rawBounce);
+
+        assert.equal(resBounce.status, 200);
+
+        const logAfterBounce = await notificationService.getLogByProviderMessageId(sgMsgId);
+        assert.equal(logAfterBounce.deliveryStatus, 'delivered', 'Out-of-order bounce must NOT downgrade delivered status');
+        assert.ok(logAfterBounce.metadata?.ignoredLateFailure, 'Ignored failure must be recorded in metadata');
+
+        // B. SendGrid engagement event (open): MUST NOT change delivery status, records openAt
+        const openEvents = [
+          {
+            sg_event_id: `evt_open_${Date.now()}`,
+            event: 'open',
+            sg_message_id: sgMsgId,
+            timestamp: Number(timestamp),
+          },
+        ];
+        const rawOpen = JSON.stringify(openEvents);
+        const sigOpen = await signSendgridPayload(privateKey, timestamp, rawOpen);
+
+        const resOpen = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'application/json')
+          .set('X-Twilio-Email-Event-Webhook-Signature', sigOpen)
+          .set('X-Twilio-Email-Event-Webhook-Timestamp', timestamp)
+          .send(rawOpen);
+
+        assert.equal(resOpen.status, 200);
+        const logAfterOpen = await notificationService.getLogByProviderMessageId(sgMsgId);
+        assert.equal(logAfterOpen.deliveryStatus, 'delivered');
+        assert.ok(logAfterOpen.metadata?.openAt, 'Engagement openAt must be recorded');
+
+        // C. Twilio out-of-order callback protection
+        const twMsgId = `SM_term_${Date.now()}`;
+        if (isDbConnected()) {
+          await NotificationLogModel.create({
+            notificationId: `NOTIF-TERM-TW-${Date.now()}`,
+            idempotencyKey: `idemp-term-tw-${Date.now()}`,
+            channel: 'whatsapp',
+            eventType: 'order_placed',
+            recipient: '+919876543210',
+            provider: 'twilio',
+            providerMessageId: twMsgId,
+            deliveryStatus: 'delivered',
+            sentAt: new Date(Date.now() - 3600000),
+          });
+        } else {
+          MEMORY_NOTIFICATION_LOGS.push({
+            notificationId: `NOTIF-TERM-TW-${Date.now()}`,
+            idempotencyKey: `idemp-term-tw-${Date.now()}`,
+            channel: 'whatsapp',
+            eventType: 'order_placed',
+            recipient: '+919876543210',
+            provider: 'twilio',
+            providerMessageId: twMsgId,
+            deliveryStatus: 'delivered',
+            sentAt: new Date(Date.now() - 3600000),
+          });
+        }
+
+        const trustedUrl = reconstructTrustedTwilioUrl({ originalUrl: '/api/webhooks/twilio' } as any);
+        const twParamsUndeliv = {
+          MessageSid: twMsgId,
+          MessageStatus: 'undelivered',
+          ErrorCode: '30008',
+          ErrorMessage: 'Unknown carrier error',
+        };
+        const twSigUndeliv = await signTwilioPayload(process.env.TWILIO_AUTH_TOKEN, trustedUrl, twParamsUndeliv);
+        const twBodyUndeliv = `MessageSid=${encodeURIComponent(twMsgId)}&MessageStatus=undelivered&ErrorCode=30008&ErrorMessage=Unknown+carrier+error`;
+
+        const resTwUndeliv = await request(app)
+          .post('/api/webhooks/twilio')
+          .set('Content-Type', 'application/x-www-form-urlencoded')
+          .set('X-Twilio-Signature', twSigUndeliv)
+          .send(twBodyUndeliv);
+
+        assert.equal(resTwUndeliv.status, 200);
+        const logAfterTwUndeliv = await notificationService.getLogByProviderMessageId(twMsgId);
+        assert.equal(logAfterTwUndeliv.deliveryStatus, 'delivered', 'Out-of-order undelivered callback must NOT downgrade delivered status');
+        assert.ok(logAfterTwUndeliv.metadata?.ignoredLateFailure);
+
+        // D. Twilio WhatsApp 'read' engagement receipt
+        const twParamsRead = { MessageSid: twMsgId, MessageStatus: 'read' };
+        const twSigRead = await signTwilioPayload(process.env.TWILIO_AUTH_TOKEN, trustedUrl, twParamsRead);
+        const resTwRead = await request(app)
+          .post('/api/webhooks/twilio')
+          .set('Content-Type', 'application/x-www-form-urlencoded')
+          .set('X-Twilio-Signature', twSigRead)
+          .send(`MessageSid=${encodeURIComponent(twMsgId)}&MessageStatus=read`);
+
+        assert.equal(resTwRead.status, 200);
+        const logAfterTwRead = await notificationService.getLogByProviderMessageId(twMsgId);
+        assert.equal(logAfterTwRead.deliveryStatus, 'delivered');
+        assert.ok(logAfterTwRead.metadata?.whatsappReadAt);
+      });
+
+      // 8. Database failures and retry/reconciliation behavior
+      it('handles database reservation failures safely and marks WebhookEvent failed on unhandled errors', async () => {
+        const { reserveWebhookEvent } = await import('../src/models/WebhookEvent.js');
+        const { env } = await import('../src/config/env.js');
+
+        // Validation rejection for empty provider/eventId
+        const invalidReservation = await reserveWebhookEvent({ provider: '', eventId: '' });
+        assert.equal(invalidReservation.reserved, false);
+        assert.ok(invalidReservation.error);
+
+        // In production mode, disconnected database must reject reservation and NOT silently use in-memory storage
+        const origNodeEnv = env.NODE_ENV;
+        try {
+          (env as any).NODE_ENV = 'production';
+          // Ensure we test the disconnected path (if DB is disconnected)
+          const isConnected = (await import('../src/config/db.js')).isDbConnected();
+          if (!isConnected) {
+            const prodRes = await reserveWebhookEvent({
+              provider: 'sendgrid',
+              eventId: `prod-offline-test-${Date.now()}`,
+            });
+            assert.equal(prodRes.reserved, false);
+            assert.equal(prodRes.isDuplicate, false);
+            assert.ok(prodRes.error?.includes('Database is disconnected'));
+          }
+        } finally {
+          (env as any).NODE_ENV = origNodeEnv;
+        }
+
+        // When verification key is not configured, endpoints return safe 500 error
+        const savedKey = process.env.SENDGRID_WEBHOOK_VERIFICATION_KEY;
+        const savedToken = process.env.TWILIO_AUTH_TOKEN;
+        try {
+          delete process.env.SENDGRID_WEBHOOK_VERIFICATION_KEY;
+          delete process.env.TWILIO_AUTH_TOKEN;
+
+          const resSgUnconfig = await request(app)
+            .post('/api/webhooks/sendgrid')
+            .set('Content-Type', 'application/json')
+            .set('X-Twilio-Email-Event-Webhook-Signature', 'sig')
+            .set('X-Twilio-Email-Event-Webhook-Timestamp', '123456')
+            .send(JSON.stringify([{ event: 'test', sg_event_id: 'e1' }]));
+
+          assert.equal(resSgUnconfig.status, 500);
+          assert.equal(resSgUnconfig.body.success, false);
+
+          const resTwUnconfig = await request(app)
+            .post('/api/webhooks/twilio')
+            .set('Content-Type', 'application/x-www-form-urlencoded')
+            .set('X-Twilio-Signature', 'sig')
+            .send('MessageSid=SM1&MessageStatus=delivered');
+
+          assert.equal(resTwUnconfig.status, 500);
+          assert.equal(resTwUnconfig.body.success, false);
+        } finally {
+          process.env.SENDGRID_WEBHOOK_VERIFICATION_KEY = savedKey;
+          process.env.TWILIO_AUTH_TOKEN = savedToken;
+        }
+      });
+
+      // 9. Rate limiting and safe error responses
+      it('enforces dedicated webhook rate limiter and returns sanitized error payloads without secrets', async () => {
+        const { createWebhookLimiter } = await import('../src/middlewares/rateLimiter.js');
+        const express = (await import('express')).default;
+        const testRateApp = express();
+        const testLimiter = createWebhookLimiter(2); // limit to 2 requests
+        testRateApp.use(testLimiter);
+        testRateApp.post('/test-webhook', (_req, res) => res.json({ success: true }));
+
+        const r1 = await request(testRateApp).post('/test-webhook');
+        assert.equal(r1.status, 200);
+
+        const r2 = await request(testRateApp).post('/test-webhook');
+        assert.equal(r2.status, 200);
+
+        const r3 = await request(testRateApp).post('/test-webhook');
+        assert.equal(r3.status, 429);
+        assert.equal(r3.body.success, false);
+        assert.ok(r3.body.message.includes('Webhook rate limit exceeded'));
+
+        // Verify that responses do not contain secrets
+        const responseText = JSON.stringify(r3.body);
+        assert.equal(responseText.includes('key'), false);
+        assert.equal(responseText.includes('token'), false);
+        assert.equal(responseText.includes('secret'), false);
+      });
+
+      // 10. Mock-mode behavior with no external network calls
+      it('verifies mock-mode behavior with zero external SendGrid or Twilio network calls', async () => {
+        const { env } = await import('../src/config/env.js');
+        const { notificationService } = await import('../src/notifications/notificationService.js');
+
+        assert.equal(env.NOTIFICATION_MODE, 'mock');
+        assert.equal(env.NOTIFICATION_EMAIL_PROVIDER, 'mock');
+        assert.equal(env.NOTIFICATION_MESSAGING_PROVIDER, 'mock');
+
+        // Verify notification dispatch uses mock provider without throwing or contacting external services
+        const mockDispatch = await notificationService.dispatch({
+          channel: 'email',
+          eventType: 'order_placed',
+          recipient: 'zero.network@example.com',
+          subject: 'No external network',
+          message: 'Zero external network calls verified',
+          idempotencyKey: `mock-zero-net-${Date.now()}`,
+          customerConsent: { email: true },
+        });
+
+        assert.equal(mockDispatch.status, 'delivered');
+        assert.ok(mockDispatch.providerMessageId?.startsWith('mock_msg_'));
+      });
+    });
 });

@@ -13,7 +13,7 @@ export function errorHandler(
   res: Response,
   _next: NextFunction
 ): void {
-  const statusCode = err.statusCode || 500;
+  const statusCode = err.statusCode || (err as any).status || 500;
   const message = err.message || 'An unexpected internal server error occurred';
   const correlationId = (req as CorrelatedRequest).correlationId;
 

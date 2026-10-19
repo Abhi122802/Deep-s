@@ -20,7 +20,7 @@ export function sanitizeLogDetails(input: unknown): string {
   text = text.replace(/Basic\s+[a-zA-Z0-9+/=]+/gi, 'Basic [REDACTED_AUTH]');
 
   // 4. Redact sensitive key-value pairs (e.g., password=..., secret=..., apiKey=...)
-  text = text.replace(/(password|passwd|currentpassword|newpassword|confirmpassword|passwordhash|secret|apiKey|api_key|token|auth|credential|jwt_secret)["']?\s*[:=]\s*["']?([^"',;\s]+)["']?/gi, '$1=[REDACTED]');
+  text = text.replace(/(password|passwd|currentpassword|newpassword|confirmpassword|passwordhash|secret|apiKey|api_key|token|auth|credential|jwt_secret|verification_key|verificationKey|webhook_key|webhookKey|webhook_verification_key)["']?\s*[:=]\s*["']?([^"',;\s]+)["']?/gi, '$1=[REDACTED]');
 
   // 5. Redact MongoDB connection strings containing passwords
   text = text.replace(/(mongodb(?:\+srv)?:\/\/[^:]+:)[^@]+(@.*)/gi, '$1[REDACTED_PASSWORD]$2');

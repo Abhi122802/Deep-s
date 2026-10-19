@@ -1,7 +1,7 @@
 import { app } from './app.js';
 import { env, validateNotificationConfig } from './config/env.js';
 import { connectDB, isDbConnected, disconnectDB } from './config/db.js';
-import { ensureNotificationLogIndexes } from './models/NotificationLog.js';
+import { ensureNotificationLogIndexes, ensureAllNotificationIndexes } from './models/NotificationLog.js';
 import { notificationService } from './notifications/notificationService.js';
 import { notificationRecoveryScheduler } from './notifications/notificationRecoveryScheduler.js';
 import { logger } from './utils/logger.js';
@@ -146,9 +146,16 @@ async function bootstrap() {
   // 3. Database-dependent initialization (Indexes & Notification Crash Recovery)
   if (isDbConnected()) {
     try {
-      const indexResult = await ensureNotificationLogIndexes({ dryRun: false });
-      if (indexResult.createdIndexes.length > 0) {
-        logger.info(`[Startup Index Sync] Created ${indexResult.createdIndexes.length} missing secondary index(es): ${indexResult.createdIndexes.join(', ')}`);
+      const allIndexResult = await ensureAllNotificationIndexes({ dryRun: false });
+      const createdCount =
+        allIndexResult.notificationLogs.createdIndexes.length +
+        allIndexResult.webhookEvents.createdIndexes.length;
+      if (createdCount > 0) {
+        const indexList = [
+          ...allIndexResult.notificationLogs.createdIndexes,
+          ...allIndexResult.webhookEvents.createdIndexes,
+        ].join(', ');
+        logger.info(`[Startup Index Sync] Created ${createdCount} missing secondary index(es): ${indexList}`);
       }
     } catch (idxErr: any) {
       logger.warn(`[Startup Index Warning] Could not sync indexes: ${idxErr.message}`);
@@ -194,7 +201,19 @@ async function bootstrap() {
   process.on('SIGINT', () => { shutdown('SIGINT'); });
 }
 
-bootstrap().catch((err) => {
-  logger.error(`[Fatal Error] Failed to start server: ${err.message}`, { error: err.stack });
-  process.exit(1);
-});
+export { bootstrap };
+
+const isDirectExecution = () => {
+  if (process.env.NODE_ENV === 'test' || process.argv.some(arg => arg.includes('test'))) {
+    return false;
+  }
+  const script = process.argv[1] || '';
+  return script.includes('index.ts') || script.includes('index.js') || script.endsWith('src') || script.endsWith('dist');
+};
+
+if (isDirectExecution()) {
+  bootstrap().catch((err) => {
+    logger.error(`[Fatal Error] Failed to start server: ${err.message}`, { error: err.stack });
+    process.exit(1);
+  });
+}

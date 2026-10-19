@@ -44,6 +44,20 @@ const SENSITIVE_KEYS = new Set([
   'refresh_token',
   'bearer',
   'credentials',
+  'sendgrid_webhook_verification_key',
+  'sendgridwebhookverificationkey',
+  'webhook_verification_key',
+  'webhookverificationkey',
+  'verification_key',
+  'verificationkey',
+  'rawbody',
+  'raw_body',
+  'rawpayload',
+  'raw_payload',
+  'dburi',
+  'db_uri',
+  'database_uri',
+  'databaseuri',
 ]);
 
 const EMAIL_KEYS = new Set([
@@ -68,6 +82,10 @@ const PHONE_KEYS = new Set([
   'contactnumber',
   'cellphone',
   'telephone',
+  'twilio_whatsapp_number',
+  'twiliowhatsappnumber',
+  'whatsapp_number',
+  'whatsappnumber',
 ]);
 
 /**
@@ -94,6 +112,26 @@ export function maskPhone(phone: string): string {
   return clean.length > 4 ? `******${clean.slice(-4)}` : '******';
 }
 
+function redactEntry(k: string, v: any, depth: number): any {
+  const lower = k.toLowerCase();
+  const normalized = lower.replace(/[-_]/g, '');
+
+  if (SENSITIVE_KEYS.has(lower) || SENSITIVE_KEYS.has(normalized)) {
+    return '[REDACTED]';
+  } else if (EMAIL_KEYS.has(lower) || EMAIL_KEYS.has(normalized)) {
+    return typeof v === 'string' ? maskEmail(v) : '[REDACTED]';
+  } else if (PHONE_KEYS.has(lower) || PHONE_KEYS.has(normalized)) {
+    return typeof v === 'string' ? maskPhone(v) : '[REDACTED]';
+  } else if (normalized === 'recipient') {
+    if (typeof v === 'string') {
+      return v.includes('@') ? maskEmail(v) : maskPhone(v);
+    } else {
+      return '[REDACTED]';
+    }
+  }
+  return redactLogData(v, depth + 1);
+}
+
 /**
  * Recursively redacts sensitive credentials, passwords, tokens, and PII from log payloads.
  */
@@ -113,7 +151,7 @@ export function redactLogData(val: any, depth = 0): any {
     };
     for (const [k, v] of Object.entries(val)) {
       if (!errorObj[k]) {
-        errorObj[k] = redactLogData(v, depth + 1);
+        errorObj[k] = redactEntry(k, v, depth);
       }
     }
     return errorObj;
@@ -124,24 +162,7 @@ export function redactLogData(val: any, depth = 0): any {
   if (typeof val === 'object') {
     const copy: Record<string, any> = {};
     for (const [k, v] of Object.entries(val)) {
-      const lower = k.toLowerCase();
-      const normalized = lower.replace(/[-_]/g, '');
-
-      if (SENSITIVE_KEYS.has(lower) || SENSITIVE_KEYS.has(normalized)) {
-        copy[k] = '[REDACTED]';
-      } else if (EMAIL_KEYS.has(lower) || EMAIL_KEYS.has(normalized)) {
-        copy[k] = typeof v === 'string' ? maskEmail(v) : '[REDACTED]';
-      } else if (PHONE_KEYS.has(lower) || PHONE_KEYS.has(normalized)) {
-        copy[k] = typeof v === 'string' ? maskPhone(v) : '[REDACTED]';
-      } else if (normalized === 'recipient') {
-        if (typeof v === 'string') {
-          copy[k] = v.includes('@') ? maskEmail(v) : maskPhone(v);
-        } else {
-          copy[k] = '[REDACTED]';
-        }
-      } else {
-        copy[k] = redactLogData(v, depth + 1);
-      }
+      copy[k] = redactEntry(k, v, depth);
     }
     return copy;
   }

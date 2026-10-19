@@ -35,3 +35,21 @@ export const authLimiter = rateLimit({
     message: 'Too many login attempts. Please try again in 15 minutes.',
   },
 });
+
+// Dedicated rate limiter for webhook callbacks (SendGrid, Twilio)
+// Provides higher request ceiling (1200 req/15min) so legitimate high-volume provider callbacks
+// are not throttled while safeguarding against volumetric Denial-of-Service attacks.
+export function createWebhookLimiter(maxRequests = 1200) {
+  return rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: maxRequests,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: {
+      success: false,
+      message: 'Webhook rate limit exceeded. Please retry later.',
+    },
+  });
+}
+
+export const webhookLimiter = createWebhookLimiter();

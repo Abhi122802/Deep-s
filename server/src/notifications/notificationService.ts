@@ -600,6 +600,7 @@ export class NotificationService {
       eventType: options.eventType,
       recipient: options.recipient,
       provider: provider.name,
+      providerMessageId: providerMsgId,
       deliveryStatus: finalStatus,
       attempts: attempt,
       maxAttempts,
@@ -854,7 +855,12 @@ export class NotificationService {
       if (params.deliveryStatus) query.deliveryStatus = params.deliveryStatus;
       if (params.search) {
         const regex = new RegExp(params.search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-        query.$or = [{ recipient: regex }, { idempotencyKey: regex }, { notificationId: regex }];
+        query.$or = [
+          { recipient: regex },
+          { idempotencyKey: regex },
+          { notificationId: regex },
+          { providerMessageId: regex },
+        ];
       }
 
       const [logs, total] = await Promise.all([
@@ -882,7 +888,9 @@ export class NotificationService {
         (l) =>
           l.recipient?.toLowerCase().includes(s) ||
           l.idempotencyKey?.toLowerCase().includes(s) ||
-          l.notificationId?.toLowerCase().includes(s)
+          l.notificationId?.toLowerCase().includes(s) ||
+          l.providerMessageId?.toLowerCase().includes(s) ||
+          l.metadata?.providerMessageId?.toLowerCase().includes(s)
       );
     }
 
@@ -897,6 +905,38 @@ export class NotificationService {
       totalPages: Math.max(1, Math.ceil(total / limit)),
     };
   }
+
+  /**
+   * Retrieves a notification audit record by its provider message ID.
+   * Checks top-level providerMessageId first, falling back to legacy metadata.providerMessageId.
+   */
+  async getLogByProviderMessageId(providerMessageId: string): Promise<any | null> {
+    if (!providerMessageId || typeof providerMessageId !== 'string' || providerMessageId.trim().length === 0) {
+      return null;
+    }
+    const trimmed = providerMessageId.trim();
+
+    if (isDbConnected()) {
+      try {
+        const record = await NotificationLogModel.findOne({
+          $or: [
+            { providerMessageId: trimmed },
+            { 'metadata.providerMessageId': trimmed },
+          ],
+        }).lean();
+        if (record) return record;
+      } catch (err: any) {
+        logger.warn(`[Notification Warning] Error looking up notification log by provider message ID: ${sanitizeLogDetails(err.message)}`);
+      }
+    }
+
+    // In-Memory lookup fallback for dev/test
+    const mem = MEMORY_NOTIFICATION_LOGS.find(
+      (l) => l.providerMessageId === trimmed || l.metadata?.providerMessageId === trimmed
+    );
+    return mem || null;
+  }
+
 
   /**
    * Admin-authorized notification retry management:
@@ -1117,6 +1157,7 @@ export class NotificationService {
           const updateData: any = {
             deliveryStatus: 'delivered',
             sentAt: now,
+            providerMessageId: result.providerMessageId,
             sanitizedError: undefined,
             metadata: {
               ...(record.metadata || {}),
@@ -1224,6 +1265,511 @@ export class NotificationService {
       this.inFlightRetries.delete(record.notificationId);
     }
   }
+
+  /**
+   * Applies webhook delivery status transition to correlating NotificationLog.
+   *
+   * Guarantees & Integrity Rules:
+   * 1. Terminal Delivered Protection: A notification in 'delivered' status MUST NEVER
+   *    be downgraded to 'sending', 'pending', or 'failed' by stale or out-of-order callbacks.
+   * 2. Engagement Separation: Engagement events (SendGrid 'open', 'click'; Twilio WhatsApp 'read')
+   *    are tracked in metadata and DO NOT alter core deliveryStatus.
+   * 3. SendGrid Lifecycles:
+   *    - 'delivered' -> transitions to 'delivered', sets sentAt, clears error.
+   *    - 'bounce', 'dropped', 'spamreport' -> transitions to 'failed', sets failedAt and error (unless delivered).
+   *    - 'processed' -> transitions 'pending' to 'sending'.
+   *    - 'deferred' -> transient; records in metadata.
+   * 4. Twilio Lifecycles:
+   *    - 'delivered' -> transitions to 'delivered', sets sentAt, clears error.
+   *    - 'undelivered', 'failed' -> transitions to 'failed', sets failedAt and error (unless delivered).
+   *    - 'queued', 'sent', 'sending' -> transitions 'pending' to 'sending'.
+   * 5. Operates across both MongoDB and in-memory test environments.
+   */
+  async applyDeliveryStatusTransition(
+    params: ApplyWebhookDeliveryStatusParams
+  ): Promise<ApplyWebhookDeliveryStatusResult> {
+    const { provider, providerMessageId, eventType, timestamp, errorCode, errorMessage } = params;
+    const cleanMsgId = (providerMessageId || '').trim();
+
+    if (!cleanMsgId) {
+      return {
+        matched: false,
+        statusChanged: false,
+        reason: 'Missing provider message ID',
+      };
+    }
+
+    let record = await this.getLogByProviderMessageId(cleanMsgId);
+    // For SendGrid, if not found and msgId contains dot (filter suffix), fallback to base ID
+    if (!record && provider === 'sendgrid' && cleanMsgId.includes('.')) {
+      record = await this.getLogByProviderMessageId(cleanMsgId.split('.')[0]);
+    }
+
+    if (!record) {
+      return {
+        matched: false,
+        statusChanged: false,
+        isIgnored: true,
+        reason: `NotificationLog not found for provider message ID "${cleanMsgId}".`,
+      };
+    }
+
+    const eventTime = timestamp instanceof Date ? timestamp : (timestamp ? new Date(timestamp) : new Date());
+    const isFromDb = isDbConnected() && Boolean(record._id);
+    const previousStatus: DeliveryStatus = record.deliveryStatus;
+
+    if (provider === 'sendgrid') {
+      const normEvent = (eventType || '').trim().toLowerCase();
+      const engagementEvents = ['open', 'click', 'unsubscribe', 'group_unsubscribe', 'group_resubscribe'];
+
+      // Engagement events: do not change deliveryStatus
+      if (engagementEvents.includes(normEvent)) {
+        const metadataUpdate = {
+          ...(record.metadata || {}),
+          [`${normEvent}At`]: eventTime,
+          lastEngagement: normEvent,
+          lastEngagementAt: eventTime,
+        };
+
+        if (isFromDb) {
+          await NotificationLogModel.findByIdAndUpdate(record._id, {
+            $set: { metadata: metadataUpdate },
+          });
+        } else {
+          record.metadata = metadataUpdate;
+        }
+
+        return {
+          matched: true,
+          statusChanged: false,
+          previousStatus,
+          currentStatus: previousStatus,
+          log: record,
+          reason: `SendGrid engagement event "${normEvent}" recorded in metadata without altering delivery status.`,
+        };
+      }
+
+      if (normEvent === 'delivered') {
+        if (previousStatus === 'delivered') {
+          return {
+            matched: true,
+            statusChanged: false,
+            previousStatus: 'delivered',
+            currentStatus: 'delivered',
+            log: record,
+            reason: 'NotificationLog already in terminal delivered status.',
+          };
+        }
+
+        const updateFields: any = {
+          deliveryStatus: 'delivered',
+          sentAt: eventTime,
+        };
+
+        if (isFromDb) {
+          const updated = await NotificationLogModel.findByIdAndUpdate(
+            record._id,
+            {
+              $set: updateFields,
+              $unset: { sanitizedError: 1 },
+            },
+            { new: true }
+          );
+          return {
+            matched: true,
+            statusChanged: true,
+            previousStatus,
+            currentStatus: 'delivered',
+            log: updated,
+            reason: 'NotificationLog transitioned to delivered.',
+          };
+        } else {
+          record.deliveryStatus = 'delivered';
+          record.sentAt = eventTime;
+          delete record.sanitizedError;
+          return {
+            matched: true,
+            statusChanged: true,
+            previousStatus,
+            currentStatus: 'delivered',
+            log: record,
+            reason: 'NotificationLog transitioned to delivered.',
+          };
+        }
+      }
+
+      if (['bounce', 'dropped', 'spamreport'].includes(normEvent)) {
+        // Terminal delivered protection
+        if (previousStatus === 'delivered') {
+          const metadataUpdate = {
+            ...(record.metadata || {}),
+            ignoredLateFailure: {
+              eventType: normEvent,
+              timestamp: eventTime,
+              error: sanitizeLogDetails(errorMessage || `SendGrid ${normEvent}`),
+            },
+          };
+
+          if (isFromDb) {
+            await NotificationLogModel.findByIdAndUpdate(record._id, {
+              $set: { metadata: metadataUpdate },
+            });
+          } else {
+            record.metadata = metadataUpdate;
+          }
+
+          return {
+            matched: true,
+            statusChanged: false,
+            previousStatus: 'delivered',
+            currentStatus: 'delivered',
+            log: record,
+            reason: `Stale or out-of-order failure callback "${normEvent}" ignored to protect terminal delivered status.`,
+          };
+        }
+
+        const errText = sanitizeLogDetails(errorMessage || `SendGrid delivery failure: ${normEvent}`);
+        const updateFields: any = {
+          deliveryStatus: 'failed',
+          failedAt: eventTime,
+          sanitizedError: errText,
+        };
+
+        if (isFromDb) {
+          const updated = await NotificationLogModel.findByIdAndUpdate(
+            record._id,
+            { $set: updateFields },
+            { new: true }
+          );
+          return {
+            matched: true,
+            statusChanged: true,
+            previousStatus,
+            currentStatus: 'failed',
+            log: updated,
+            reason: `NotificationLog transitioned to failed on SendGrid "${normEvent}".`,
+          };
+        } else {
+          record.deliveryStatus = 'failed';
+          record.failedAt = eventTime;
+          record.sanitizedError = errText;
+          return {
+            matched: true,
+            statusChanged: true,
+            previousStatus,
+            currentStatus: 'failed',
+            log: record,
+            reason: `NotificationLog transitioned to failed on SendGrid "${normEvent}".`,
+          };
+        }
+      }
+
+      if (normEvent === 'processed') {
+        if (previousStatus === 'pending') {
+          const updateFields: any = { deliveryStatus: 'sending' };
+          if (isFromDb) {
+            const updated = await NotificationLogModel.findByIdAndUpdate(
+              record._id,
+              { $set: updateFields },
+              { new: true }
+            );
+            return {
+              matched: true,
+              statusChanged: true,
+              previousStatus,
+              currentStatus: 'sending',
+              log: updated,
+              reason: 'NotificationLog transitioned to sending on SendGrid processed.',
+            };
+          } else {
+            record.deliveryStatus = 'sending';
+            return {
+              matched: true,
+              statusChanged: true,
+              previousStatus,
+              currentStatus: 'sending',
+              log: record,
+              reason: 'NotificationLog transitioned to sending on SendGrid processed.',
+            };
+          }
+        }
+
+        return {
+          matched: true,
+          statusChanged: false,
+          previousStatus,
+          currentStatus: previousStatus,
+          log: record,
+          reason: `SendGrid processed event does not change status from "${previousStatus}".`,
+        };
+      }
+
+      if (normEvent === 'deferred') {
+        const metadataUpdate = {
+          ...(record.metadata || {}),
+          deferredAt: eventTime,
+          deferredReason: sanitizeLogDetails(errorMessage || 'SendGrid deferred'),
+        };
+        if (isFromDb) {
+          await NotificationLogModel.findByIdAndUpdate(record._id, {
+            $set: { metadata: metadataUpdate },
+          });
+        } else {
+          record.metadata = metadataUpdate;
+        }
+        return {
+          matched: true,
+          statusChanged: false,
+          previousStatus,
+          currentStatus: previousStatus,
+          log: record,
+          reason: 'Transient deferred event recorded in metadata.',
+        };
+      }
+
+      // Unsupported SendGrid event
+      return {
+        matched: true,
+        statusChanged: false,
+        isIgnored: true,
+        previousStatus,
+        currentStatus: previousStatus,
+        log: record,
+        reason: `Unsupported SendGrid event type "${eventType}".`,
+      };
+    }
+
+    if (provider === 'twilio') {
+      const normTwilioStatus = (eventType || '').trim().toLowerCase();
+
+      // Engagement: WhatsApp read receipt
+      if (normTwilioStatus === 'read') {
+        const metadataUpdate = {
+          ...(record.metadata || {}),
+          whatsappReadAt: eventTime,
+        };
+        if (isFromDb) {
+          await NotificationLogModel.findByIdAndUpdate(record._id, {
+            $set: { metadata: metadataUpdate },
+          });
+        } else {
+          record.metadata = metadataUpdate;
+        }
+        return {
+          matched: true,
+          statusChanged: false,
+          previousStatus,
+          currentStatus: previousStatus,
+          log: record,
+          reason: 'WhatsApp read receipt recorded in metadata without altering delivery status.',
+        };
+      }
+
+      if (normTwilioStatus === 'delivered') {
+        if (previousStatus === 'delivered') {
+          return {
+            matched: true,
+            statusChanged: false,
+            previousStatus: 'delivered',
+            currentStatus: 'delivered',
+            log: record,
+            reason: 'NotificationLog already in terminal delivered status.',
+          };
+        }
+
+        const updateFields: any = {
+          deliveryStatus: 'delivered',
+          sentAt: eventTime,
+        };
+
+        if (isFromDb) {
+          const updated = await NotificationLogModel.findByIdAndUpdate(
+            record._id,
+            {
+              $set: updateFields,
+              $unset: { sanitizedError: 1 },
+            },
+            { new: true }
+          );
+          return {
+            matched: true,
+            statusChanged: true,
+            previousStatus,
+            currentStatus: 'delivered',
+            log: updated,
+            reason: 'NotificationLog transitioned to delivered.',
+          };
+        } else {
+          record.deliveryStatus = 'delivered';
+          record.sentAt = eventTime;
+          delete record.sanitizedError;
+          return {
+            matched: true,
+            statusChanged: true,
+            previousStatus,
+            currentStatus: 'delivered',
+            log: record,
+            reason: 'NotificationLog transitioned to delivered.',
+          };
+        }
+      }
+
+      if (['undelivered', 'failed'].includes(normTwilioStatus)) {
+        // Terminal delivered protection
+        if (previousStatus === 'delivered') {
+          const metadataUpdate = {
+            ...(record.metadata || {}),
+            ignoredLateFailure: {
+              eventType: normTwilioStatus,
+              errorCode,
+              errorMessage: sanitizeLogDetails(errorMessage || 'Twilio delivery failed'),
+              timestamp: eventTime,
+            },
+          };
+
+          if (isFromDb) {
+            await NotificationLogModel.findByIdAndUpdate(record._id, {
+              $set: { metadata: metadataUpdate },
+            });
+          } else {
+            record.metadata = metadataUpdate;
+          }
+
+          return {
+            matched: true,
+            statusChanged: false,
+            previousStatus: 'delivered',
+            currentStatus: 'delivered',
+            log: record,
+            reason: `Stale or out-of-order failure callback "${normTwilioStatus}" ignored to protect terminal delivered status.`,
+          };
+        }
+
+        const errText = sanitizeLogDetails(
+          errorCode || errorMessage
+            ? `Twilio error ${errorCode || ''}: ${errorMessage || 'Delivery failed'}`.trim()
+            : 'Twilio delivery failed'
+        );
+        const updateFields: any = {
+          deliveryStatus: 'failed',
+          failedAt: eventTime,
+          sanitizedError: errText,
+        };
+
+        if (isFromDb) {
+          const updated = await NotificationLogModel.findByIdAndUpdate(
+            record._id,
+            { $set: updateFields },
+            { new: true }
+          );
+          return {
+            matched: true,
+            statusChanged: true,
+            previousStatus,
+            currentStatus: 'failed',
+            log: updated,
+            reason: `NotificationLog transitioned to failed on Twilio "${normTwilioStatus}".`,
+          };
+        } else {
+          record.deliveryStatus = 'failed';
+          record.failedAt = eventTime;
+          record.sanitizedError = errText;
+          return {
+            matched: true,
+            statusChanged: true,
+            previousStatus,
+            currentStatus: 'failed',
+            log: record,
+            reason: `NotificationLog transitioned to failed on Twilio "${normTwilioStatus}".`,
+          };
+        }
+      }
+
+      if (['queued', 'sent', 'sending'].includes(normTwilioStatus)) {
+        if (previousStatus === 'pending') {
+          const updateFields: any = { deliveryStatus: 'sending' };
+          if (isFromDb) {
+            const updated = await NotificationLogModel.findByIdAndUpdate(
+              record._id,
+              { $set: updateFields },
+              { new: true }
+            );
+            return {
+              matched: true,
+              statusChanged: true,
+              previousStatus,
+              currentStatus: 'sending',
+              log: updated,
+              reason: `NotificationLog transitioned to sending on Twilio "${normTwilioStatus}".`,
+            };
+          } else {
+            record.deliveryStatus = 'sending';
+            return {
+              matched: true,
+              statusChanged: true,
+              previousStatus,
+              currentStatus: 'sending',
+              log: record,
+              reason: `NotificationLog transitioned to sending on Twilio "${normTwilioStatus}".`,
+            };
+          }
+        }
+
+        return {
+          matched: true,
+          statusChanged: false,
+          previousStatus,
+          currentStatus: previousStatus,
+          log: record,
+          reason: `Twilio "${normTwilioStatus}" callback does not downgrade or change status from "${previousStatus}".`,
+        };
+      }
+
+      // Unsupported Twilio event
+      return {
+        matched: true,
+        statusChanged: false,
+        isIgnored: true,
+        previousStatus,
+        currentStatus: previousStatus,
+        log: record,
+        reason: `Unsupported Twilio event type "${eventType}".`,
+      };
+    }
+
+    return {
+      matched: false,
+      statusChanged: false,
+      reason: `Unknown provider "${provider}".`,
+    };
+  }
+}
+
+export interface ApplyWebhookDeliveryStatusParams {
+  provider: 'sendgrid' | 'twilio';
+  providerMessageId: string;
+  eventType: string;
+  timestamp?: Date;
+  errorCode?: string;
+  errorMessage?: string;
+  rawPayload?: Record<string, any>;
+}
+
+export interface ApplyWebhookDeliveryStatusResult {
+  matched: boolean;
+  statusChanged: boolean;
+  previousStatus?: DeliveryStatus;
+  currentStatus?: DeliveryStatus;
+  log?: any;
+  reason?: string;
+  isIgnored?: boolean;
 }
 
 export const notificationService = new NotificationService();
+
+export const drainInFlight = (timeoutMs?: number) => notificationService.drainInFlight(timeoutMs);
+export const getActiveTaskCount = () => notificationService.getActiveTaskCount();
+export const trackTask = <T>(promise: Promise<T>) => notificationService.trackTask(promise);
+export const getLogByProviderMessageId = (id: string) => notificationService.getLogByProviderMessageId(id);
+export const applyDeliveryStatusTransition = (params: ApplyWebhookDeliveryStatusParams) =>
+  notificationService.applyDeliveryStatusTransition(params);
