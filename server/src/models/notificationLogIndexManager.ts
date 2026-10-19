@@ -54,6 +54,7 @@ export const REQUIRED_NOTIFICATION_LOG_INDEXES: IndexSpecification[] = [
  * Declared and required indexes for WebhookEvent collection:
  * - 1 compound unique index on { provider, eventId } for durable cross-process deduplication
  * - 1 sparse secondary index on providerMessageId for correlation lookups
+ * - 1 compound query index on { status, nextRetryAt, createdAt } for background recovery scans (Phase 5, Milestone 3)
  */
 export const REQUIRED_WEBHOOK_EVENT_INDEXES: IndexSpecification[] = [
   {
@@ -67,6 +68,11 @@ export const REQUIRED_WEBHOOK_EVENT_INDEXES: IndexSpecification[] = [
     key: { providerMessageId: 1 },
     background: true,
     sparse: true,
+  },
+  {
+    name: 'status_1_nextRetryAt_1_createdAt_1',
+    key: { status: 1, nextRetryAt: 1, createdAt: 1 },
+    background: true,
   },
 ];
 

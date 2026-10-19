@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import request from 'supertest';
 import mongoose from 'mongoose';
@@ -4670,6 +4670,930 @@ describe('Deep’s Cake Shop — Phase 2 Backend API Test Suite', () => {
 
         assert.equal(mockDispatch.status, 'delivered');
         assert.ok(mockDispatch.providerMessageId?.startsWith('mock_msg_'));
+      });
+    });
+
+    // =========================================================================
+    // 21. WebhookEvent Schema, Fenced Lease Helpers, and Cache Pruning
+    // (Phase 5, Milestone 3, Work Item 2)
+    // =========================================================================
+    describe('21. WebhookEvent Schema, Fenced Lease Helpers, and Cache Pruning (Phase 5, Milestone 3, Work Item 2)', () => {
+      beforeEach(async () => {
+        const { clearMemoryWebhookEvents } = await import('../src/models/WebhookEvent.js');
+        clearMemoryWebhookEvents();
+      });
+
+      // 1. WebhookEvent index specifications include recovery scan index
+      it('REQUIRED_WEBHOOK_EVENT_INDEXES declares compound recovery scan index', async () => {
+        const { REQUIRED_WEBHOOK_EVENT_INDEXES } = await import(
+          '../src/models/notificationLogIndexManager.js'
+        );
+
+        const recoveryIdx = REQUIRED_WEBHOOK_EVENT_INDEXES.find(
+          (i) => i.name === 'status_1_nextRetryAt_1_createdAt_1'
+        );
+        assert.ok(recoveryIdx, 'Must declare status_1_nextRetryAt_1_createdAt_1 recovery index');
+        assert.deepEqual(recoveryIdx.key, { status: 1, nextRetryAt: 1, createdAt: 1 });
+        assert.equal(recoveryIdx.background, true);
+      });
+
+      // 2. claimWebhookEvent atomically claims an eligible event and increments leaseGeneration
+      it('claimWebhookEvent claims eligible event and increments leaseGeneration fencing token', async () => {
+        const { reserveWebhookEvent, claimWebhookEvent } = await import('../src/models/WebhookEvent.js');
+
+        const eventId = `claim_test_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+        const reserved = await reserveWebhookEvent({
+          provider: 'sendgrid',
+          eventId,
+          eventType: 'delivered',
+        });
+        assert.equal(reserved.reserved, true);
+
+        const claimRes = await claimWebhookEvent({
+          id: reserved.event.id || reserved.event._id,
+          workerId: 'worker_alpha',
+          leaseDurationMs: 15_000,
+        });
+
+        assert.equal(claimRes.claimed, true);
+        assert.ok(claimRes.event);
+        assert.equal(claimRes.event.status, 'processing');
+        assert.equal(claimRes.event.lockedBy, 'worker_alpha');
+        assert.equal(claimRes.event.leaseGeneration, 1);
+        assert.equal(claimRes.event.retryCount, 1);
+        assert.ok(claimRes.event.lockedUntil);
+        assert.ok(new Date(claimRes.event.lockedUntil).getTime() > Date.now());
+      });
+
+      // 3. claimWebhookEvent rejects already locked, backoff, or maxRetries-exceeded events
+      it('claimWebhookEvent respects active locks, backoff schedules, and max retries', async () => {
+        const { reserveWebhookEvent, claimWebhookEvent } = await import('../src/models/WebhookEvent.js');
+
+        const eventId = `lock_test_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+        const reserved = await reserveWebhookEvent({
+          provider: 'sendgrid',
+          eventId,
+          eventType: 'delivered',
+        });
+        const docId = reserved.event.id || reserved.event._id;
+
+        // Claim once
+        const firstClaim = await claimWebhookEvent({
+          id: docId,
+          workerId: 'worker_1',
+          leaseDurationMs: 30_000,
+        });
+        assert.equal(firstClaim.claimed, true);
+
+        // Immediate second claim attempt must be rejected because active lease has not expired
+        const secondClaim = await claimWebhookEvent({
+          id: docId,
+          workerId: 'worker_2',
+        });
+        assert.equal(secondClaim.claimed, false);
+        assert.ok(secondClaim.reason?.includes('lock unavailable') || secondClaim.reason?.includes('No eligible'));
+
+        // Test maxRetries threshold rejection
+        reserved.event.lockedUntil = new Date(Date.now() - 1000); // Expire lock
+        reserved.event.retryCount = 3; // Exhaust retries
+        reserved.event.maxRetries = 3;
+        reserved.event.status = 'failed';
+
+        const exhaustedClaim = await claimWebhookEvent({
+          id: docId,
+          workerId: 'worker_3',
+        });
+        assert.equal(exhaustedClaim.claimed, false);
+
+        // Test nextRetryAt backoff in future rejection
+        reserved.event.retryCount = 1;
+        reserved.event.nextRetryAt = new Date(Date.now() + 60_000); // In future
+
+        const backoffClaim = await claimWebhookEvent({
+          id: docId,
+          workerId: 'worker_4',
+        });
+        assert.equal(backoffClaim.claimed, false);
+      });
+
+      // 4. completeWebhookEvent succeeds with valid leaseGeneration and clears locks
+      it('completeWebhookEvent succeeds with valid fencing token and releases lease locks', async () => {
+        const { reserveWebhookEvent, claimWebhookEvent, completeWebhookEvent } = await import(
+          '../src/models/WebhookEvent.js'
+        );
+
+        const eventId = `complete_test_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+        const reserved = await reserveWebhookEvent({
+          provider: 'twilio',
+          eventId,
+          eventType: 'delivered',
+        });
+        const docId = reserved.event.id || reserved.event._id;
+
+        const claimRes = await claimWebhookEvent({ id: docId });
+        assert.equal(claimRes.claimed, true);
+
+        const completeRes = await completeWebhookEvent({
+          id: docId,
+          leaseGeneration: claimRes.event.leaseGeneration,
+          status: 'processed',
+        });
+
+        assert.equal(completeRes.success, true);
+        assert.equal(completeRes.event.status, 'processed');
+        assert.equal(completeRes.event.lockedUntil, undefined);
+        assert.equal(completeRes.event.lockedBy, undefined);
+        assert.ok(completeRes.event.processedAt);
+      });
+
+      // 5. completeWebhookEvent enforces fencing token and rejects stale worker updates
+      it('completeWebhookEvent detects fencing token mismatch and rejects stale worker updates', async () => {
+        const { reserveWebhookEvent, claimWebhookEvent, completeWebhookEvent } = await import(
+          '../src/models/WebhookEvent.js'
+        );
+
+        const eventId = `fence_test_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+        const reserved = await reserveWebhookEvent({
+          provider: 'sendgrid',
+          eventId,
+          eventType: 'delivered',
+        });
+        const docId = reserved.event.id || reserved.event._id;
+
+        // Worker 1 claims event (leaseGeneration = 1)
+        const worker1Claim = await claimWebhookEvent({ id: docId, workerId: 'worker_1', leaseDurationMs: 100 });
+        assert.equal(worker1Claim.claimed, true);
+        assert.equal(worker1Claim.event.leaseGeneration, 1);
+
+        // Worker 1's lease expires; Worker 2 reclaims event (leaseGeneration = 2)
+        reserved.event.lockedUntil = new Date(Date.now() - 1000);
+        const worker2Claim = await claimWebhookEvent({ id: docId, workerId: 'worker_2' });
+        assert.equal(worker2Claim.claimed, true);
+        assert.equal(worker2Claim.event.leaseGeneration, 2);
+
+        // Worker 1 wakes up and attempts to complete with its stale leaseGeneration (1)
+        const staleComplete = await completeWebhookEvent({
+          id: docId,
+          leaseGeneration: 1, // Stale token!
+          status: 'processed',
+        });
+
+        assert.equal(staleComplete.success, false);
+        assert.ok(
+          staleComplete.reason?.includes('Fencing token mismatch'),
+          `Expected fencing token mismatch error, got: ${staleComplete.reason}`
+        );
+
+        // Worker 2 completes with its current leaseGeneration (2) -> must succeed
+        const validComplete = await completeWebhookEvent({
+          id: docId,
+          leaseGeneration: 2,
+          status: 'processed',
+        });
+        assert.equal(validComplete.success, true);
+        assert.equal(validComplete.event.status, 'processed');
+      });
+
+      // 6. completeWebhookEvent handles failure backoff and dead-letter transitions
+      it('completeWebhookEvent applies retry backoff and dead-letters after maxRetries', async () => {
+        const { reserveWebhookEvent, claimWebhookEvent, completeWebhookEvent } = await import(
+          '../src/models/WebhookEvent.js'
+        );
+
+        const eventId = `fail_backoff_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+        const reserved = await reserveWebhookEvent({
+          provider: 'twilio',
+          eventId,
+          eventType: 'failed',
+        });
+        const docId = reserved.event.id || reserved.event._id;
+
+        // Attempt 1 failure: should schedule nextRetryAt with backoff
+        const claim1 = await claimWebhookEvent({ id: docId });
+        assert.equal(claim1.claimed, true);
+
+        const fail1 = await completeWebhookEvent({
+          id: docId,
+          leaseGeneration: claim1.event.leaseGeneration,
+          status: 'failed',
+          errorMessage: 'Temporary database timeout',
+          retryBackoffMs: 5000,
+        });
+
+        assert.equal(fail1.success, true);
+        assert.equal(fail1.event.status, 'failed');
+        assert.equal(fail1.event.lastError, 'Temporary database timeout');
+        assert.ok(fail1.event.nextRetryAt);
+        assert.ok(new Date(fail1.event.nextRetryAt).getTime() > Date.now());
+
+        // Fast-forward backoff & exhaust retries to test terminal dead-lettering
+        fail1.event.nextRetryAt = new Date(Date.now() - 1000);
+        fail1.event.retryCount = 2; // Next claim will make it 3 (maxRetries = 3)
+
+        const claim3 = await claimWebhookEvent({ id: docId });
+        assert.equal(claim3.claimed, true);
+        assert.equal(claim3.event.retryCount, 3);
+
+        const deadLetterFail = await completeWebhookEvent({
+          id: docId,
+          leaseGeneration: claim3.event.leaseGeneration,
+          status: 'failed',
+          errorMessage: 'Permanent processing failure',
+          maxRetries: 3,
+        });
+
+        assert.equal(deadLetterFail.success, true);
+        assert.equal(deadLetterFail.event.status, 'failed');
+        assert.equal(deadLetterFail.event.nextRetryAt, undefined, 'Terminal failure must not schedule nextRetryAt');
+      });
+
+      // 7. In-memory cache pruning and isolation
+      it('pruneMemoryWebhookEvents and clearMemoryWebhookEvents maintain cache bounds', async () => {
+        const {
+          MEMORY_WEBHOOK_EVENTS,
+          MEMORY_WEBHOOK_EVENTS_MAX_CAPACITY,
+          pruneMemoryWebhookEvents,
+          clearMemoryWebhookEvents,
+          reserveWebhookEvent,
+        } = await import('../src/models/WebhookEvent.js');
+
+        clearMemoryWebhookEvents();
+        assert.equal(MEMORY_WEBHOOK_EVENTS.length, 0);
+
+        // Fill memory store to 510 items
+        for (let i = 0; i < 510; i++) {
+          MEMORY_WEBHOOK_EVENTS.push({
+            id: `fill_${i}`,
+            provider: 'mock',
+            eventId: `evt_${i}`,
+            status: 'received',
+          });
+        }
+        assert.equal(MEMORY_WEBHOOK_EVENTS.length, 510);
+
+        pruneMemoryWebhookEvents(500);
+        assert.equal(MEMORY_WEBHOOK_EVENTS.length, 500);
+        assert.equal(MEMORY_WEBHOOK_EVENTS[0].id, 'fill_10', 'Oldest 10 items must be dropped');
+        assert.equal(MEMORY_WEBHOOK_EVENTS[499].id, 'fill_509', 'Newest item preserved');
+
+        // Test reserveWebhookEvent auto-pruning
+        clearMemoryWebhookEvents();
+        assert.equal(MEMORY_WEBHOOK_EVENTS_MAX_CAPACITY, 500);
+      });
+
+      // 8. reserveWebhookEvent exposes existingStatus and canRetry on collision
+      it('reserveWebhookEvent accurately reports existingStatus and canRetry on collision', async () => {
+        const { reserveWebhookEvent, completeWebhookEvent, claimWebhookEvent } = await import(
+          '../src/models/WebhookEvent.js'
+        );
+
+        const eventId = `collision_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+        const res1 = await reserveWebhookEvent({
+          provider: 'sendgrid',
+          eventId,
+          eventType: 'delivered',
+        });
+        const docId = res1.event.id || res1.event._id;
+
+        // Collision while unlocked 'received': canRetry should be true
+        const dup1 = await reserveWebhookEvent({ provider: 'sendgrid', eventId });
+        assert.equal(dup1.isDuplicate, true);
+        assert.equal(dup1.existingStatus, 'received');
+        assert.equal(dup1.canRetry, true);
+
+        // Claim and lock event: canRetry should be false while lock is active
+        const claim = await claimWebhookEvent({ id: docId });
+        assert.equal(claim.claimed, true);
+
+        const dupLocked = await reserveWebhookEvent({ provider: 'sendgrid', eventId });
+        assert.equal(dupLocked.isDuplicate, true);
+        assert.equal(dupLocked.canRetry, false, 'Locked processing event cannot be retried concurrently');
+
+        // Fail event with immediate retry: canRetry should become true
+        await completeWebhookEvent({
+          id: docId,
+          leaseGeneration: claim.event.leaseGeneration,
+          status: 'failed',
+          errorMessage: 'Transient network failure',
+          retryBackoffMs: 0,
+        });
+
+        const dupFailed = await reserveWebhookEvent({ provider: 'sendgrid', eventId });
+        assert.equal(dupFailed.isDuplicate, true);
+        assert.equal(dupFailed.existingStatus, 'failed');
+        assert.equal(dupFailed.canRetry, true, 'Failed event should be eligible for retry');
+
+        // Claim and complete event: canRetry should become false when processed
+        const claim2 = await claimWebhookEvent({ id: docId });
+        await completeWebhookEvent({
+          id: docId,
+          leaseGeneration: claim2.event.leaseGeneration,
+          status: 'processed',
+        });
+
+        const dupProcessed = await reserveWebhookEvent({ provider: 'sendgrid', eventId });
+        assert.equal(dupProcessed.isDuplicate, true);
+        assert.equal(dupProcessed.existingStatus, 'processed');
+        assert.equal(dupProcessed.canRetry, false, 'Processed event cannot be retried');
+      });
+    });
+
+    // =========================================================================
+    // 22. Smart Re-delivery Handling in Webhook Controllers (AUD-M3-01 Fix)
+    // (Phase 5, Milestone 3, Work Item 3)
+    // =========================================================================
+    describe('22. Smart Re-delivery Handling in Webhook Controllers (Phase 5, Milestone 3, Work Item 3)', () => {
+      async function getCrypto() {
+        return (await import('crypto')).default;
+      }
+
+      async function generateSendgridTestKeyPair() {
+        const crypto = await getCrypto();
+        const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', {
+          namedCurve: 'prime256v1',
+        });
+        const spkiDer = publicKey.export({ format: 'der', type: 'spki' });
+        const base64Key = spkiDer.toString('base64');
+        return { publicKey, privateKey, base64Key };
+      }
+
+      async function signSendgridPayload(privateKey: any, timestamp: string, rawBody: string | Buffer): Promise<string> {
+        const crypto = await getCrypto();
+        const timestampBuf = Buffer.from(timestamp, 'utf8');
+        const bodyBuf = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(rawBody, 'utf8');
+        const payload = Buffer.concat([timestampBuf, bodyBuf]);
+        return crypto.sign('sha256', payload, privateKey).toString('base64');
+      }
+
+      async function signTwilioPayload(authToken: string, url: string, params: Record<string, any>): Promise<string> {
+        const crypto = await getCrypto();
+        let data = url;
+        const sortedKeys = Object.keys(params).sort();
+        for (const key of sortedKeys) {
+          data += key + params[key];
+        }
+        return crypto.createHmac('sha1', authToken).update(Buffer.from(data, 'utf8')).digest('base64');
+      }
+
+      beforeEach(async () => {
+        const { clearMemoryWebhookEvents } = await import('../src/models/WebhookEvent.js');
+        clearMemoryWebhookEvents();
+      });
+
+      // 1. SendGrid re-claims and successfully processes re-delivered failed event
+      it('SendGrid controller re-claims and completes re-delivered failed event (AUD-M3-01)', async () => {
+        const { NotificationLogModel, MEMORY_NOTIFICATION_LOGS } = await import('../src/models/NotificationLog.js');
+        const { WebhookEventModel, MEMORY_WEBHOOK_EVENTS } = await import('../src/models/WebhookEvent.js');
+        const { isDbConnected } = await import('../src/config/db.js');
+        const { notificationService } = await import('../src/notifications/notificationService.js');
+
+        const { privateKey, base64Key } = await generateSendgridTestKeyPair();
+        process.env.SENDGRID_WEBHOOK_VERIFICATION_KEY = base64Key;
+
+        const sgMsgId = `sg_redeliver_${Date.now()}`;
+        const sgEvtId = `evt_failed_retry_${Date.now()}`;
+
+        // Seed notification log in pending state
+        if (isDbConnected()) {
+          await NotificationLogModel.create({
+            notificationId: `NOTIF-REDELIV-${Date.now()}`,
+            idempotencyKey: `idemp-redeliv-${Date.now()}`,
+            channel: 'email',
+            eventType: 'order_placed',
+            recipient: 'redeliver.sg@example.com',
+            provider: 'sendgrid',
+            providerMessageId: sgMsgId,
+            deliveryStatus: 'sent',
+            sentAt: new Date(),
+          });
+
+          // Seed failed WebhookEvent
+          await WebhookEventModel.create({
+            provider: 'sendgrid',
+            eventId: sgEvtId,
+            providerMessageId: sgMsgId,
+            eventType: 'delivered',
+            status: 'failed',
+            lastError: 'Simulated transient database disconnect during initial receipt',
+            receivedAt: new Date(Date.now() - 30_000),
+            leaseGeneration: 1,
+            retryCount: 1,
+            maxRetries: 3,
+          });
+        } else {
+          MEMORY_NOTIFICATION_LOGS.push({
+            notificationId: `NOTIF-REDELIV-${Date.now()}`,
+            idempotencyKey: `idemp-redeliv-${Date.now()}`,
+            channel: 'email',
+            eventType: 'order_placed',
+            recipient: 'redeliver.sg@example.com',
+            provider: 'sendgrid',
+            providerMessageId: sgMsgId,
+            deliveryStatus: 'sent',
+            sentAt: new Date(),
+          });
+
+          MEMORY_WEBHOOK_EVENTS.push({
+            id: `mem_wh_failed_${Date.now()}`,
+            provider: 'sendgrid',
+            eventId: sgEvtId,
+            providerMessageId: sgMsgId,
+            eventType: 'delivered',
+            status: 'failed',
+            lastError: 'Simulated transient database disconnect during initial receipt',
+            receivedAt: new Date(Date.now() - 30_000),
+            leaseGeneration: 1,
+            retryCount: 1,
+            maxRetries: 3,
+          });
+        }
+
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const payload = [
+          {
+            sg_event_id: sgEvtId,
+            event: 'delivered',
+            sg_message_id: sgMsgId,
+            timestamp: Number(timestamp),
+          },
+        ];
+        const rawBody = JSON.stringify(payload);
+        const signature = await signSendgridPayload(privateKey, timestamp, rawBody);
+
+        // Send re-delivery request
+        const res = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'application/json')
+          .set('X-Twilio-Email-Event-Webhook-Signature', signature)
+          .set('X-Twilio-Email-Event-Webhook-Timestamp', timestamp)
+          .send(rawBody);
+
+        assert.equal(res.status, 200);
+        assert.equal(res.body.success, true);
+        assert.equal(res.body.processedCount, 1, 'Re-delivered event must be processed, not ignored as duplicate');
+        assert.equal(res.body.duplicateCount, 0);
+
+        // Verify NotificationLog transitioned to delivered
+        const updatedLog = await notificationService.getLogByProviderMessageId(sgMsgId);
+        assert.ok(updatedLog);
+        assert.equal(updatedLog.deliveryStatus, 'delivered');
+      });
+
+      // 2. Twilio re-claims and successfully processes re-delivered failed callback
+      it('Twilio controller re-claims and completes re-delivered failed callback (AUD-M3-01)', async () => {
+        const { NotificationLogModel, MEMORY_NOTIFICATION_LOGS } = await import('../src/models/NotificationLog.js');
+        const { WebhookEventModel, MEMORY_WEBHOOK_EVENTS } = await import('../src/models/WebhookEvent.js');
+        const { reconstructTrustedTwilioUrl } = await import('../src/services/webhookVerification.js');
+        const { isDbConnected } = await import('../src/config/db.js');
+        const { notificationService } = await import('../src/notifications/notificationService.js');
+
+        const twilioAuthToken = 'twilio_redeliver_test_token';
+        process.env.TWILIO_AUTH_TOKEN = twilioAuthToken;
+
+        const twMsgId = `SM_redeliver_${Date.now()}`;
+        const eventId = `${twMsgId}:delivered`;
+
+        // Seed notification log
+        if (isDbConnected()) {
+          await NotificationLogModel.create({
+            notificationId: `NOTIF-TW-REDELIV-${Date.now()}`,
+            idempotencyKey: `idemp-tw-redeliv-${Date.now()}`,
+            channel: 'sms',
+            eventType: 'order_placed',
+            recipient: '+919876543210',
+            provider: 'twilio',
+            providerMessageId: twMsgId,
+            deliveryStatus: 'sent',
+            sentAt: new Date(),
+          });
+
+          // Seed failed WebhookEvent
+          await WebhookEventModel.create({
+            provider: 'twilio',
+            eventId,
+            providerMessageId: twMsgId,
+            eventType: 'delivered',
+            status: 'failed',
+            lastError: 'Simulated server restart interruption',
+            receivedAt: new Date(Date.now() - 20_000),
+            leaseGeneration: 1,
+            retryCount: 1,
+            maxRetries: 3,
+          });
+        } else {
+          MEMORY_NOTIFICATION_LOGS.push({
+            notificationId: `NOTIF-TW-REDELIV-${Date.now()}`,
+            idempotencyKey: `idemp-tw-redeliv-${Date.now()}`,
+            channel: 'sms',
+            eventType: 'order_placed',
+            recipient: '+919876543210',
+            provider: 'twilio',
+            providerMessageId: twMsgId,
+            deliveryStatus: 'sent',
+            sentAt: new Date(),
+          });
+
+          MEMORY_WEBHOOK_EVENTS.push({
+            id: `mem_wh_tw_failed_${Date.now()}`,
+            provider: 'twilio',
+            eventId,
+            providerMessageId: twMsgId,
+            eventType: 'delivered',
+            status: 'failed',
+            lastError: 'Simulated server restart interruption',
+            receivedAt: new Date(Date.now() - 20_000),
+            leaseGeneration: 1,
+            retryCount: 1,
+            maxRetries: 3,
+          });
+        }
+
+        const trustedUrl = reconstructTrustedTwilioUrl({ originalUrl: '/api/webhooks/twilio' } as any);
+        const params = { MessageSid: twMsgId, MessageStatus: 'delivered' };
+        const signature = await signTwilioPayload(twilioAuthToken, trustedUrl, params);
+        const formBody = `MessageSid=${encodeURIComponent(twMsgId)}&MessageStatus=delivered`;
+
+        // Send re-delivery callback
+        const res = await request(app)
+          .post('/api/webhooks/twilio')
+          .set('Content-Type', 'application/x-www-form-urlencoded')
+          .set('X-Twilio-Signature', signature)
+          .send(formBody);
+
+        assert.equal(res.status, 200);
+        assert.equal(res.body.success, true);
+        assert.equal(res.body.statusChanged, true, 'Re-delivered callback must change delivery status');
+
+        // Verify NotificationLog transitioned to delivered
+        const updatedLog = await notificationService.getLogByProviderMessageId(twMsgId);
+        assert.ok(updatedLog);
+        assert.equal(updatedLog.deliveryStatus, 'delivered');
+      });
+
+      // 3. Re-delivery of completed event acknowledges duplicate without re-processing
+      it('re-delivery of already processed event acknowledges duplicate without re-applying mutations', async () => {
+        const { privateKey, base64Key } = await generateSendgridTestKeyPair();
+        process.env.SENDGRID_WEBHOOK_VERIFICATION_KEY = base64Key;
+
+        const sgMsgId = `sg_already_proc_${Date.now()}`;
+        const sgEvtId = `evt_proc_${Date.now()}`;
+
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const payload = [
+          {
+            sg_event_id: sgEvtId,
+            event: 'delivered',
+            sg_message_id: sgMsgId,
+            timestamp: Number(timestamp),
+          },
+        ];
+        const rawBody = JSON.stringify(payload);
+        const signature = await signSendgridPayload(privateKey, timestamp, rawBody);
+
+        // First delivery
+        const res1 = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'application/json')
+          .set('X-Twilio-Email-Event-Webhook-Signature', signature)
+          .set('X-Twilio-Email-Event-Webhook-Timestamp', timestamp)
+          .send(rawBody);
+
+        assert.equal(res1.status, 200);
+
+        // Re-delivery when already processed
+        const res2 = await request(app)
+          .post('/api/webhooks/sendgrid')
+          .set('Content-Type', 'application/json')
+          .set('X-Twilio-Email-Event-Webhook-Signature', signature)
+          .set('X-Twilio-Email-Event-Webhook-Timestamp', timestamp)
+          .send(rawBody);
+
+        assert.equal(res2.status, 200);
+        assert.equal(res2.body.processedCount, 0, 'Already processed event must not be re-processed');
+        assert.equal(res2.body.duplicateCount, 1, 'Must be flagged as duplicate');
+      });
+
+      // 4. Safe bypass when event is currently locked in processing by an active worker
+      it('bypasses duplicate execution when event is currently locked by active worker', async () => {
+        const { WebhookEventModel, MEMORY_WEBHOOK_EVENTS } = await import('../src/models/WebhookEvent.js');
+        const { isDbConnected } = await import('../src/config/db.js');
+        const { reconstructTrustedTwilioUrl } = await import('../src/services/webhookVerification.js');
+
+        const twilioAuthToken = 'twilio_active_lock_token';
+        process.env.TWILIO_AUTH_TOKEN = twilioAuthToken;
+
+        const twMsgId = `SM_active_lock_${Date.now()}`;
+        const eventId = `${twMsgId}:delivered`;
+
+        // Seed an event currently in 'processing' with a future lockedUntil (30s from now)
+        if (isDbConnected()) {
+          await WebhookEventModel.create({
+            provider: 'twilio',
+            eventId,
+            providerMessageId: twMsgId,
+            eventType: 'delivered',
+            status: 'processing',
+            lockedUntil: new Date(Date.now() + 30_000),
+            lockedBy: 'worker_concurrent_active',
+            leaseGeneration: 1,
+            retryCount: 1,
+          });
+        } else {
+          MEMORY_WEBHOOK_EVENTS.push({
+            id: `mem_wh_locked_${Date.now()}`,
+            provider: 'twilio',
+            eventId,
+            providerMessageId: twMsgId,
+            eventType: 'delivered',
+            status: 'processing',
+            lockedUntil: new Date(Date.now() + 30_000),
+            lockedBy: 'worker_concurrent_active',
+            leaseGeneration: 1,
+            retryCount: 1,
+          });
+        }
+
+        const trustedUrl = reconstructTrustedTwilioUrl({ originalUrl: '/api/webhooks/twilio' } as any);
+        const params = { MessageSid: twMsgId, MessageStatus: 'delivered' };
+        const signature = await signTwilioPayload(twilioAuthToken, trustedUrl, params);
+        const formBody = `MessageSid=${encodeURIComponent(twMsgId)}&MessageStatus=delivered`;
+
+        const res = await request(app)
+          .post('/api/webhooks/twilio')
+          .set('Content-Type', 'application/x-www-form-urlencoded')
+          .set('X-Twilio-Signature', signature)
+          .send(formBody);
+
+        assert.equal(res.status, 200);
+        assert.ok(res.body.message.includes('duplicate') || res.body.message.includes('currently being processed'));
+      });
+    });
+
+    // =========================================================================
+    // 23. Inbound Webhook Recovery Scheduler & Concurrency Guarantees (AUD-M3-02 Fix)
+    // (Phase 5, Milestone 3, Work Item 4 & 5)
+    // =========================================================================
+    describe('23. Inbound Webhook Recovery Scheduler & Concurrency Guarantees (Phase 5, Milestone 3)', () => {
+      beforeEach(async () => {
+        const { clearMemoryWebhookEvents } = await import('../src/models/WebhookEvent.js');
+        clearMemoryWebhookEvents();
+      });
+
+      // 1. Lifecycle management
+      it('scheduler lifecycle: manages start, duplicate start guard, isRunning, and clean stop', async () => {
+        const { WebhookRecoveryScheduler } = await import('../src/notifications/webhookRecoveryScheduler.js');
+        const scheduler = new WebhookRecoveryScheduler({ intervalMs: 10_000 });
+
+        assert.equal(scheduler.isRunning(), false);
+        scheduler.start();
+        assert.equal(scheduler.isRunning(), true);
+
+        // Duplicate start does not throw or create second timer
+        scheduler.start();
+        assert.equal(scheduler.isRunning(), true);
+
+        scheduler.stop();
+        assert.equal(scheduler.isRunning(), false);
+      });
+
+      // 2. Recovery of interrupted webhook event
+      it('scheduler tick: recovers interrupted webhook event and applies terminal delivery transition', async () => {
+        const { WebhookRecoveryScheduler } = await import('../src/notifications/webhookRecoveryScheduler.js');
+        const { NotificationLogModel, MEMORY_NOTIFICATION_LOGS } = await import('../src/models/NotificationLog.js');
+        const { WebhookEventModel, MEMORY_WEBHOOK_EVENTS } = await import('../src/models/WebhookEvent.js');
+        const { isDbConnected } = await import('../src/config/db.js');
+        const { notificationService } = await import('../src/notifications/notificationService.js');
+
+        const msgId = `sg_interrupted_${Date.now()}`;
+        const evtId = `evt_interrupted_${Date.now()}`;
+
+        // Seed a NotificationLog stuck in 'sent'
+        if (isDbConnected()) {
+          await NotificationLogModel.create({
+            notificationId: `NOTIF-REC-${Date.now()}`,
+            idempotencyKey: `idemp-rec-${Date.now()}`,
+            channel: 'email',
+            eventType: 'order_placed',
+            recipient: 'recovery.test@example.com',
+            provider: 'sendgrid',
+            providerMessageId: msgId,
+            deliveryStatus: 'sent',
+            sentAt: new Date(Date.now() - 120_000),
+          });
+
+          // Seed an interrupted WebhookEvent in status 'received', older than 60s
+          await WebhookEventModel.create({
+            provider: 'sendgrid',
+            eventId: evtId,
+            providerMessageId: msgId,
+            eventType: 'delivered',
+            status: 'received',
+            receivedAt: new Date(Date.now() - 90_000),
+            createdAt: new Date(Date.now() - 90_000),
+            leaseGeneration: 0,
+            retryCount: 0,
+            maxRetries: 3,
+          });
+        } else {
+          MEMORY_NOTIFICATION_LOGS.push({
+            notificationId: `NOTIF-REC-${Date.now()}`,
+            idempotencyKey: `idemp-rec-${Date.now()}`,
+            channel: 'email',
+            eventType: 'order_placed',
+            recipient: 'recovery.test@example.com',
+            provider: 'sendgrid',
+            providerMessageId: msgId,
+            deliveryStatus: 'sent',
+            sentAt: new Date(Date.now() - 120_000),
+          });
+
+          MEMORY_WEBHOOK_EVENTS.push({
+            id: `mem_wh_rec_${Date.now()}`,
+            provider: 'sendgrid',
+            eventId: evtId,
+            providerMessageId: msgId,
+            eventType: 'delivered',
+            status: 'received',
+            receivedAt: new Date(Date.now() - 90_000),
+            createdAt: new Date(Date.now() - 90_000),
+            leaseGeneration: 0,
+            retryCount: 0,
+            maxRetries: 3,
+          });
+        }
+
+        const scheduler = new WebhookRecoveryScheduler({ minAgeMs: 60_000, batchSize: 10 });
+        const recoveredCount = await scheduler.tick();
+
+        assert.equal(recoveredCount, 1, 'Scheduler tick must recover the interrupted event');
+
+        // Verify NotificationLog transitioned to 'delivered'
+        const log = await notificationService.getLogByProviderMessageId(msgId);
+        assert.ok(log);
+        assert.equal(log.deliveryStatus, 'delivered');
+
+        // Verify WebhookEvent transitioned to 'processed'
+        if (isDbConnected()) {
+          const doc = await WebhookEventModel.findOne({ provider: 'sendgrid', eventId: evtId }).lean();
+          assert.equal(doc?.status, 'processed');
+          assert.ok(doc?.processedAt);
+        } else {
+          const mem = MEMORY_WEBHOOK_EVENTS.find((e) => e.eventId === evtId);
+          assert.equal(mem?.status, 'processed');
+          assert.ok(mem?.processedAt);
+        }
+      });
+
+      // 3. Unroutable event cleanly transitions to ignored
+      it('scheduler tick: handles unroutable event and marks it ignored without crashing', async () => {
+        const { WebhookRecoveryScheduler } = await import('../src/notifications/webhookRecoveryScheduler.js');
+        const { WebhookEventModel, MEMORY_WEBHOOK_EVENTS } = await import('../src/models/WebhookEvent.js');
+        const { isDbConnected } = await import('../src/config/db.js');
+
+        const unroutableEvtId = `evt_unroutable_${Date.now()}`;
+        const unroutableMsgId = `nonexistent_msg_${Date.now()}`;
+
+        if (isDbConnected()) {
+          await WebhookEventModel.create({
+            provider: 'sendgrid',
+            eventId: unroutableEvtId,
+            providerMessageId: unroutableMsgId,
+            eventType: 'delivered',
+            status: 'received',
+            receivedAt: new Date(Date.now() - 90_000),
+            createdAt: new Date(Date.now() - 90_000),
+            leaseGeneration: 0,
+            retryCount: 0,
+            maxRetries: 3,
+          });
+        } else {
+          MEMORY_WEBHOOK_EVENTS.push({
+            id: `mem_unroutable_${Date.now()}`,
+            provider: 'sendgrid',
+            eventId: unroutableEvtId,
+            providerMessageId: unroutableMsgId,
+            eventType: 'delivered',
+            status: 'received',
+            receivedAt: new Date(Date.now() - 90_000),
+            createdAt: new Date(Date.now() - 90_000),
+            leaseGeneration: 0,
+            retryCount: 0,
+            maxRetries: 3,
+          });
+        }
+
+        const scheduler = new WebhookRecoveryScheduler({ minAgeMs: 60_000, batchSize: 10 });
+        const recoveredCount = await scheduler.tick();
+        assert.equal(recoveredCount, 0, 'Unroutable event should not be counted as recovered');
+
+        if (isDbConnected()) {
+          const doc = await WebhookEventModel.findOne({ provider: 'sendgrid', eventId: unroutableEvtId }).lean();
+          assert.equal(doc?.status, 'ignored');
+          assert.ok(doc?.errorMessage?.includes('not found'));
+        } else {
+          const mem = MEMORY_WEBHOOK_EVENTS.find((e) => e.eventId === unroutableEvtId);
+          assert.equal(mem?.status, 'ignored');
+          assert.ok(mem?.errorMessage?.includes('not found'));
+        }
+      });
+
+      // 4. Recovery tick records failure and schedules backoff when transition throws
+      it('scheduler tick: handles unexpected transition exceptions with backoff and dead-letters after maxRetries', async () => {
+        const { WebhookRecoveryScheduler } = await import('../src/notifications/webhookRecoveryScheduler.js');
+        const { WebhookEventModel, MEMORY_WEBHOOK_EVENTS } = await import('../src/models/WebhookEvent.js');
+        const { isDbConnected } = await import('../src/config/db.js');
+        const { notificationService } = await import('../src/notifications/notificationService.js');
+
+        const errEvtId = `evt_throw_${Date.now()}`;
+        const errMsgId = `msg_throw_${Date.now()}`;
+
+        if (isDbConnected()) {
+          await WebhookEventModel.create({
+            provider: 'sendgrid',
+            eventId: errEvtId,
+            providerMessageId: errMsgId,
+            eventType: 'delivered',
+            status: 'received',
+            receivedAt: new Date(Date.now() - 90_000),
+            createdAt: new Date(Date.now() - 90_000),
+            leaseGeneration: 0,
+            retryCount: 2, // 2 prior attempts, next will be 3 (maxRetries)
+            maxRetries: 3,
+          });
+        } else {
+          MEMORY_WEBHOOK_EVENTS.push({
+            id: `mem_throw_${Date.now()}`,
+            provider: 'sendgrid',
+            eventId: errEvtId,
+            providerMessageId: errMsgId,
+            eventType: 'delivered',
+            status: 'received',
+            receivedAt: new Date(Date.now() - 90_000),
+            createdAt: new Date(Date.now() - 90_000),
+            leaseGeneration: 0,
+            retryCount: 2,
+            maxRetries: 3,
+          });
+        }
+
+        // Mock applyDeliveryStatusTransition to throw an unexpected transient error
+        const origTransition = notificationService.applyDeliveryStatusTransition.bind(notificationService);
+        (notificationService as any).applyDeliveryStatusTransition = async () => {
+          throw new Error('Simulated upstream database connection reset');
+        };
+
+        try {
+          const scheduler = new WebhookRecoveryScheduler({ minAgeMs: 60_000, batchSize: 10 });
+          const recovered = await scheduler.tick();
+          assert.equal(recovered, 0);
+
+          if (isDbConnected()) {
+            const doc = await WebhookEventModel.findOne({ provider: 'sendgrid', eventId: errEvtId }).lean();
+            assert.equal(doc?.status, 'failed');
+            assert.equal(doc?.retryCount, 3);
+            assert.equal(doc?.nextRetryAt, undefined, 'Exhausted retries must dead-letter without nextRetryAt');
+            assert.ok(doc?.errorMessage?.includes('connection reset'));
+          } else {
+            const mem = MEMORY_WEBHOOK_EVENTS.find((e) => e.eventId === errEvtId);
+            assert.equal(mem?.status, 'failed');
+            assert.equal(mem?.retryCount, 3);
+            assert.equal(mem?.nextRetryAt, undefined, 'Exhausted retries must dead-letter without nextRetryAt');
+            assert.ok(mem?.errorMessage?.includes('connection reset'));
+          }
+        } finally {
+          (notificationService as any).applyDeliveryStatusTransition = origTransition;
+        }
+      });
+
+      // 5. Overlap protection
+      it('scheduler tick: guards against overlapping execution when scan is already in flight', async () => {
+        const { WebhookRecoveryScheduler } = await import('../src/notifications/webhookRecoveryScheduler.js');
+        const scheduler = new WebhookRecoveryScheduler();
+
+        // Simulate execution flag set
+        (scheduler as any).isExecuting = true;
+        const result = await scheduler.tick();
+        assert.equal(result, 0, 'Must immediately return 0 and skip execution when previous tick is in flight');
+        (scheduler as any).isExecuting = false;
+      });
+
+      // 6. Graceful shutdown handler integration
+      it('graceful shutdown handler cleanly terminates webhook recovery scheduler', async () => {
+        const { createShutdownHandler } = await import('../src/index.js');
+        let stopped = false;
+        const mockWebhookScheduler = {
+          stop: () => {
+            stopped = true;
+          },
+        };
+
+        const shutdown = createShutdownHandler({
+          webhookRecoveryScheduler: mockWebhookScheduler as any,
+          onExit: () => {},
+        });
+
+        await shutdown('SIGTERM');
+        assert.equal(stopped, true, 'Shutdown handler must stop webhook recovery scheduler');
       });
     });
 });

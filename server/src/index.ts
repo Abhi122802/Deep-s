@@ -4,6 +4,7 @@ import { connectDB, isDbConnected, disconnectDB } from './config/db.js';
 import { ensureNotificationLogIndexes, ensureAllNotificationIndexes } from './models/NotificationLog.js';
 import { notificationService } from './notifications/notificationService.js';
 import { notificationRecoveryScheduler } from './notifications/notificationRecoveryScheduler.js';
+import { webhookRecoveryScheduler } from './notifications/webhookRecoveryScheduler.js';
 import { logger } from './utils/logger.js';
 
 export interface ShutdownOptions {
@@ -14,6 +15,7 @@ export interface ShutdownOptions {
   };
   notificationService?: { drainInFlight: (timeoutMs: number) => Promise<{ drained: boolean; pendingCount: number }> };
   recoveryScheduler?: { stop: () => void };
+  webhookRecoveryScheduler?: { stop: () => void };
   disconnectDB?: () => Promise<void>;
   drainTimeoutMs?: number;
   serverCloseTimeoutMs?: number;
@@ -34,6 +36,7 @@ export function createShutdownHandler(options: ShutdownOptions = {}) {
 
   const targetNotificationService = options.notificationService || notificationService;
   const targetScheduler = options.recoveryScheduler || notificationRecoveryScheduler;
+  const targetWebhookScheduler = options.webhookRecoveryScheduler || webhookRecoveryScheduler;
   const targetDisconnectDB = options.disconnectDB || disconnectDB;
   const drainTimeoutMs = options.drainTimeoutMs ?? env.NOTIFICATION_DRAIN_TIMEOUT_MS ?? 10000;
   const serverCloseTimeoutMs = options.serverCloseTimeoutMs ?? drainTimeoutMs;
@@ -47,11 +50,16 @@ export function createShutdownHandler(options: ShutdownOptions = {}) {
 
     logger.info(`[Shutdown] Received ${signal}. Terminating server cleanly...`);
 
-    // 1. Stop background recovery scheduler
+    // 1. Stop background recovery schedulers
     try {
       targetScheduler.stop();
     } catch (schedErr: any) {
       logger.warn(`[Shutdown Warning] Error stopping recovery scheduler: ${schedErr.message}`);
+    }
+    try {
+      targetWebhookScheduler.stop();
+    } catch (schedErr: any) {
+      logger.warn(`[Shutdown Warning] Error stopping webhook recovery scheduler: ${schedErr.message}`);
     }
 
     // 2. Stop accepting new HTTP requests and handle keep-alive connections safely
@@ -170,8 +178,18 @@ async function bootstrap() {
       logger.warn(`[Startup Recovery Warning] Initial recovery scan error: ${recErr.message}`);
     }
 
-    // Start background recovery scheduler with controlled lifecycle
+    try {
+      const initialWebhookRecovered = await webhookRecoveryScheduler.tick();
+      if (initialWebhookRecovered > 0) {
+        logger.info(`[Startup Webhook Recovery] Recovered ${initialWebhookRecovered} interrupted webhook event(s).`);
+      }
+    } catch (recErr: any) {
+      logger.warn(`[Startup Webhook Recovery Warning] Initial webhook recovery scan error: ${recErr.message}`);
+    }
+
+    // Start background recovery schedulers with controlled lifecycle
     notificationRecoveryScheduler.start();
+    webhookRecoveryScheduler.start();
   } else if (env.NODE_ENV === 'production') {
     const errorMsg = '[Startup Fatal] Database connection is required in production mode. Refusing startup without persistent database.';
     logger.error(errorMsg);
@@ -194,6 +212,7 @@ async function bootstrap() {
     server,
     notificationService,
     recoveryScheduler: notificationRecoveryScheduler,
+    webhookRecoveryScheduler,
     disconnectDB,
   });
 

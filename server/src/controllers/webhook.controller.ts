@@ -10,6 +10,8 @@ import {
 import {
   reserveWebhookEvent,
   updateWebhookEventStatus,
+  claimWebhookEvent,
+  completeWebhookEvent,
 } from '../models/WebhookEvent.js';
 import { notificationService } from '../notifications/notificationService.js';
 
@@ -22,9 +24,10 @@ import { notificationService } from '../notifications/notificationService.js';
  * 2. Enforces ECDSA SHA-256 signature and timestamp verification using SENDGRID_WEBHOOK_VERIFICATION_KEY.
  * 3. Enforces payload schema (non-empty JSON array).
  * 4. Iterates events, reserving each via `reserveWebhookEvent` for durable deduplication (`sg_event_id`).
- * 5. Applies delivery status updates via `notificationService.applyDeliveryStatusTransition`, protecting terminal states.
- * 6. Marks WebhookEvent as 'processed', 'ignored', or 'failed' based on work completion.
- * 7. Never logs secrets, raw signatures, or customer PII.
+ * 5. Supports safe re-delivery: if duplicate was 'failed' or unlocked, re-claims via `claimWebhookEvent`.
+ * 6. Applies delivery status updates via `notificationService.applyDeliveryStatusTransition`, protecting terminal states.
+ * 7. Finalizes event via `completeWebhookEvent` with fencing token protection.
+ * 8. Never logs secrets, raw signatures, or customer PII.
  */
 export async function handleSendgridWebhook(req: Request, res: Response): Promise<void> {
   // 1. Raw body preservation check
@@ -91,7 +94,7 @@ export async function handleSendgridWebhook(req: Request, res: Response): Promis
     return;
   }
 
-  // 6. Process Events with Durable Deduplication
+  // 6. Process Events with Durable Deduplication and Safe Re-delivery Handling (AUD-M3-01)
   let processedCount = 0;
   let duplicateCount = 0;
   let ignoredCount = 0;
@@ -125,21 +128,48 @@ export async function handleSendgridWebhook(req: Request, res: Response): Promis
       sanitizedSummary,
     });
 
+    let docId: string;
+    let leaseGeneration = 0;
+    let isClaimed = false;
+
     if (reservation.isDuplicate) {
-      duplicateCount++;
-      continue;
-    }
+      if (!reservation.canRetry) {
+        duplicateCount++;
+        continue;
+      }
 
-    if (!reservation.reserved) {
-      logger.error(`[Webhook Error] Failed to reserve SendGrid event: ${reservation.error}`);
-      res.status(500).json({
-        success: false,
-        message: 'Internal Server Error: Failed to reserve webhook event',
+      // Re-delivery of a failed or unlocked received event: attempt atomic claim
+      docId = String(reservation.event?._id || reservation.event?.id);
+      const claim = await claimWebhookEvent({
+        id: docId,
+        workerId: `http_sendgrid_retry_${process.pid}_${Date.now()}`,
       });
-      return;
-    }
 
-    const eventRecord = reservation.event;
+      if (!claim.claimed) {
+        duplicateCount++;
+        continue;
+      }
+
+      leaseGeneration = claim.event?.leaseGeneration || 0;
+      isClaimed = true;
+    } else {
+      if (!reservation.reserved) {
+        logger.error(`[Webhook Error] Failed to reserve SendGrid event: ${reservation.error}`);
+        res.status(500).json({
+          success: false,
+          message: 'Internal Server Error: Failed to reserve webhook event',
+        });
+        return;
+      }
+
+      docId = String(reservation.event?._id || reservation.event?.id);
+      const claim = await claimWebhookEvent({
+        id: docId,
+        workerId: `http_sendgrid_${process.pid}_${Date.now()}`,
+      });
+      leaseGeneration = claim.claimed ? claim.event?.leaseGeneration || 0 : 0;
+      isClaimed = claim.claimed;
+    }
 
     try {
       if (providerMessageId && eventType) {
@@ -154,20 +184,55 @@ export async function handleSendgridWebhook(req: Request, res: Response): Promis
 
         if (transitionResult.isIgnored || !transitionResult.matched) {
           ignoredCount++;
-          await updateWebhookEventStatus(eventRecord, 'ignored', transitionResult.reason);
+          if (isClaimed) {
+            await completeWebhookEvent({
+              id: docId,
+              leaseGeneration,
+              status: 'ignored',
+              errorMessage: transitionResult.reason,
+            });
+          } else {
+            await updateWebhookEventStatus(reservation.event, 'ignored', transitionResult.reason);
+          }
         } else {
           processedCount++;
-          await updateWebhookEventStatus(eventRecord, 'processed');
+          if (isClaimed) {
+            await completeWebhookEvent({
+              id: docId,
+              leaseGeneration,
+              status: 'processed',
+            });
+          } else {
+            await updateWebhookEventStatus(reservation.event, 'processed');
+          }
         }
       } else {
         ignoredCount++;
-        await updateWebhookEventStatus(eventRecord, 'ignored', 'Missing sg_message_id or event type');
+        if (isClaimed) {
+          await completeWebhookEvent({
+            id: docId,
+            leaseGeneration,
+            status: 'ignored',
+            errorMessage: 'Missing sg_message_id or event type',
+          });
+        } else {
+          await updateWebhookEventStatus(reservation.event, 'ignored', 'Missing sg_message_id or event type');
+        }
       }
     } catch (err: any) {
       logger.error(
         `[Webhook Error] Error processing SendGrid event ${eventId}: ${sanitizeLogDetails(err.message)}`
       );
-      await updateWebhookEventStatus(eventRecord, 'failed', err.message);
+      if (isClaimed) {
+        await completeWebhookEvent({
+          id: docId,
+          leaseGeneration,
+          status: 'failed',
+          errorMessage: err.message,
+        });
+      } else {
+        await updateWebhookEventStatus(reservation.event, 'failed', err.message);
+      }
       res.status(500).json({
         success: false,
         message: 'Internal Server Error: Failed to process webhook event',
@@ -194,9 +259,10 @@ export async function handleSendgridWebhook(req: Request, res: Response): Promis
  * 2. Neutralizes Host header injection by reconstructing URL from trusted configuration.
  * 3. Validates required payload attributes (MessageSid, MessageStatus).
  * 4. Integrates `reserveWebhookEvent` with stable `${MessageSid}:${MessageStatus}` eventId.
- * 5. Applies status transition on correlating NotificationLog, preserving terminal 'delivered'.
- * 6. Marks WebhookEvent as 'processed', 'ignored', or 'failed' based on work completion.
- * 7. Never logs authentication tokens, raw signatures, or customer PII.
+ * 5. Supports safe re-delivery: if duplicate was 'failed' or unlocked, re-claims via `claimWebhookEvent`.
+ * 6. Applies status transition on correlating NotificationLog, preserving terminal 'delivered'.
+ * 7. Finalizes event via `completeWebhookEvent` with fencing token protection.
+ * 8. Never logs authentication tokens, raw signatures, or customer PII.
  */
 export async function handleTwilioWebhook(req: Request, res: Response): Promise<void> {
   // 1. Signature Header Extraction
@@ -276,7 +342,7 @@ export async function handleTwilioWebhook(req: Request, res: Response): Promise<
     sequenceNumber: req.body?.SequenceNumber,
   };
 
-  // 6. Deduplication Reservation
+  // 6. Deduplication Reservation & Safe Re-delivery Handling (AUD-M3-01)
   const reservation = await reserveWebhookEvent({
     provider: 'twilio',
     eventId,
@@ -285,24 +351,54 @@ export async function handleTwilioWebhook(req: Request, res: Response): Promise<
     sanitizedSummary,
   });
 
+  let docId: string;
+  let leaseGeneration = 0;
+  let isClaimed = false;
+
   if (reservation.isDuplicate) {
-    res.status(200).json({
-      success: true,
-      message: 'Twilio callback already processed (duplicate)',
-    });
-    return;
-  }
+    if (!reservation.canRetry) {
+      res.status(200).json({
+        success: true,
+        message: 'Twilio callback already processed (duplicate)',
+      });
+      return;
+    }
 
-  if (!reservation.reserved) {
-    logger.error(`[Webhook Error] Failed to reserve Twilio event: ${reservation.error}`);
-    res.status(500).json({
-      success: false,
-      message: 'Internal Server Error: Failed to reserve webhook event',
+    // Re-delivery of a failed or unlocked received callback: attempt atomic claim
+    docId = String(reservation.event?._id || reservation.event?.id);
+    const claim = await claimWebhookEvent({
+      id: docId,
+      workerId: `http_twilio_retry_${process.pid}_${Date.now()}`,
     });
-    return;
-  }
 
-  const eventRecord = reservation.event;
+    if (!claim.claimed) {
+      res.status(200).json({
+        success: true,
+        message: 'Twilio callback currently being processed',
+      });
+      return;
+    }
+
+    leaseGeneration = claim.event?.leaseGeneration || 0;
+    isClaimed = true;
+  } else {
+    if (!reservation.reserved) {
+      logger.error(`[Webhook Error] Failed to reserve Twilio event: ${reservation.error}`);
+      res.status(500).json({
+        success: false,
+        message: 'Internal Server Error: Failed to reserve webhook event',
+      });
+      return;
+    }
+
+    docId = String(reservation.event?._id || reservation.event?.id);
+    const claim = await claimWebhookEvent({
+      id: docId,
+      workerId: `http_twilio_${process.pid}_${Date.now()}`,
+    });
+    leaseGeneration = claim.claimed ? claim.event?.leaseGeneration || 0 : 0;
+    isClaimed = claim.claimed;
+  }
 
   // 7. Apply Status Transition
   try {
@@ -316,9 +412,26 @@ export async function handleTwilioWebhook(req: Request, res: Response): Promise<
     });
 
     if (transitionResult.isIgnored || !transitionResult.matched) {
-      await updateWebhookEventStatus(eventRecord, 'ignored', transitionResult.reason);
+      if (isClaimed) {
+        await completeWebhookEvent({
+          id: docId,
+          leaseGeneration,
+          status: 'ignored',
+          errorMessage: transitionResult.reason,
+        });
+      } else {
+        await updateWebhookEventStatus(reservation.event, 'ignored', transitionResult.reason);
+      }
     } else {
-      await updateWebhookEventStatus(eventRecord, 'processed');
+      if (isClaimed) {
+        await completeWebhookEvent({
+          id: docId,
+          leaseGeneration,
+          status: 'processed',
+        });
+      } else {
+        await updateWebhookEventStatus(reservation.event, 'processed');
+      }
     }
 
     res.status(200).json({
@@ -330,7 +443,16 @@ export async function handleTwilioWebhook(req: Request, res: Response): Promise<
     logger.error(
       `[Webhook Error] Error processing Twilio event ${eventId}: ${sanitizeLogDetails(err.message)}`
     );
-    await updateWebhookEventStatus(eventRecord, 'failed', err.message);
+    if (isClaimed) {
+      await completeWebhookEvent({
+        id: docId,
+        leaseGeneration,
+        status: 'failed',
+        errorMessage: err.message,
+      });
+    } else {
+      await updateWebhookEventStatus(reservation.event, 'failed', err.message);
+    }
     res.status(500).json({
       success: false,
       message: 'Internal Server Error: Failed to process webhook event',
