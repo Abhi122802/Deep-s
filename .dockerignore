@@ -1,0 +1,12 @@
+node_modules
+dist
+dist-ssr
+server
+tests
+.git
+.gitignore
+.env
+.env.*
+*.log
+README.md
+.oxlintrc.json
